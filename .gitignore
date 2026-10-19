@@ -1,0 +1,22 @@
+# Compiled class files
+bin/
+*.class
+
+# Storage runtime data directories
+data/
+*.wal
+*.sst
+*.idx
+*.blm
+*.achunk
+
+# Temporary and build artifacts
+sources.txt
+*.log
+
+# IDE and OS files
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
