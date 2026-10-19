@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AetherDB - Distributed Storage Engine Dashboard</title>
+    <style>
+        :root {
+            --bg-primary: #090d16;
+            --bg-secondary: #131b2e;
+            --bg-card: rgba(26, 38, 66, 0.65);
+            --accent-cyan: #00f2fe;
+            --accent-blue: #4facfe;
+            --accent-emerald: #10b981;
+            --accent-amber: #f59e0b;
+            --accent-rose: #f43f5e;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --border-glow: rgba(79, 172, 254, 0.25);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+        }
+
+        body {
+            background-color: var(--bg-primary);
+            color: var(--text-main);
+            padding: 24px;
+            background-image: radial-gradient(circle at 10% 20%, rgba(0, 242, 254, 0.05) 0%, transparent 40%),
+                              radial-gradient(circle at 90% 80%, rgba(79, 172, 254, 0.05) 0%, transparent 40%);
+            min-height: 100vh;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 28px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid var(--border-glow);
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+
+        .brand-icon {
+            font-size: 32px;
+            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .brand h1 {
+            font-size: 26px;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+        }
+
+        .cluster-badge {
+            background: var(--bg-card);
+            border: 1px solid var(--border-glow);
+            padding: 8px 16px;
+            border-radius: 999px;
+            font-size: 13px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: var(--accent-emerald);
+            box-shadow: 0 0 10px var(--accent-emerald);
+        }
+
+        .grid-stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+            gap: 18px;
+            margin-bottom: 28px;
+        }
+
+        .stat-card {
+            background: var(--bg-card);
+            backdrop-filter: blur(12px);
+            border: 1px solid var(--border-glow);
+            border-radius: 12px;
+            padding: 20px;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .stat-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 24px rgba(0, 242, 254, 0.1);
+        }
+
+        .stat-label {
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+        }
+
+        .stat-value {
+            font-size: 28px;
+            font-weight: 800;
+            color: var(--text-main);
+        }
+
+        .main-panels {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 24px;
+        }
+
+        @media (max-width: 900px) {
+            .main-panels { grid-template-columns: 1fr; }
+        }
+
+        .panel {
+            background: var(--bg-card);
+            backdrop-filter: blur(12px);
+            border: 1px solid var(--border-glow);
+            border-radius: 14px;
+            padding: 24px;
+        }
+
+        .panel h2 {
+            font-size: 18px;
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--accent-cyan);
+        }
+
+        .input-group {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            margin-bottom: 14px;
+        }
+
+        .input-group label {
+            font-size: 13px;
+            color: var(--text-muted);
+        }
+
+        input, textarea, select {
+            background: rgba(15, 23, 42, 0.8);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: var(--text-main);
+            padding: 10px 14px;
+            border-radius: 8px;
+            outline: none;
+            font-size: 14px;
+            transition: border-color 0.2s;
+        }
+
+        input:focus, textarea:focus {
+            border-color: var(--accent-blue);
+        }
+
+        .btn-row {
+            display: flex;
+            gap: 10px;
+            margin-top: 10px;
+        }
+
+        button {
+            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue));
+            color: #000;
+            font-weight: 700;
+            border: none;
+            padding: 10px 18px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+
+        button:hover { opacity: 0.9; }
+
+        .btn-danger {
+            background: var(--accent-rose);
+            color: #fff;
+        }
+
+        .console-output {
+            background: #050811;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 8px;
+            padding: 14px;
+            margin-top: 14px;
+            font-family: "Courier New", monospace;
+            font-size: 12px;
+            color: #38bdf8;
+            max-height: 180px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+        }
+    </style>
+</head>
+<body>
+
+    <header>
+        <div class="brand">
+            <span class="brand-icon">⚡</span>
+            <div>
+                <h1>AetherDB</h1>
+                <p style="font-size: 12px; color: var(--text-muted);">Distributed Key-Value & Columnar Analytics Engine (Java 26)</p>
+            </div>
+        </div>
+        <div class="cluster-badge">
+            <span class="status-dot"></span>
+            <span id="raftRole">Node: node-1 | Role: LEADER | Term: 1</span>
+        </div>
+    </header>
+
+    <div class="grid-stats">
+        <div class="stat-card">
+            <div class="stat-label">Total Puts</div>
+            <div class="stat-value" id="statPuts">0</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Total Gets</div>
+            <div class="stat-value" id="statGets">0</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">MemTable Records</div>
+            <div class="stat-value" id="statMemtable">0</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Active SSTables</div>
+            <div class="stat-value" id="statSstables">0</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Columnar Rows</div>
+            <div class="stat-value" id="statColumnar">0</div>
+        </div>
+    </div>
+
+    <div class="main-panels">
+        <!-- Panel 1: Key-Value Engine Tester -->
+        <div class="panel">
+            <h2>🔑 Key-Value LSM Operations</h2>
+            <div class="input-group">
+                <label>Key</label>
+                <input type="text" id="kvKey" placeholder="e.g. user:1001" value="user:1001" />
+            </div>
+            <div class="input-group">
+                <label>Value (JSON / String)</label>
+                <input type="text" id="kvVal" placeholder="e.g. {\"name\":\"Alice\",\"tier\":\"VIP\"}" value="active-session-token" />
+            </div>
+            <div class="btn-row">
+                <button onclick="execKvPut()">PUT</button>
+                <button onclick="execKvGet()" style="background:#3b82f6; color:#fff;">GET</button>
+                <button onclick="execKvDelete()" class="btn-danger">DELETE</button>
+            </div>
+            <div class="console-output" id="kvOutput">// Key-Value console ready. Click PUT, GET, or DELETE to interact with LSM storage.</div>
+        </div>
+
+        <!-- Panel 2: Vectorized Columnar Query Runner -->
+        <div class="panel">
+            <h2>📊 Columnar Analytics & Vectorized Query</h2>
+            <div class="input-group">
+                <label>Table Name</label>
+                <input type="text" id="queryTable" value="telemetry" />
+            </div>
+            <div class="input-group">
+                <label>Select / Aggregate Expression</label>
+                <input type="text" id="querySelect" value="COUNT(*)" />
+            </div>
+            <div class="btn-row">
+                <button onclick="execQuery()">RUN QUERY</button>
+                <button onclick="ingestSampleData()" style="background:#10b981; color:#fff;">INGEST SAMPLE DATA</button>
+            </div>
+            <div class="console-output" id="queryOutput">// Analytical query console ready. Click RUN QUERY to scan columnar chunks.</div>
+        </div>
+    </div>
+
+    <script>
+        async function fetchMetrics() {
+            try {
+                const res = await fetch('/api/v1/metrics');
+                if (res.ok) {
+                    const data = await res.json();
+                    document.getElementById('statPuts').innerText = data.totalPuts || 0;
+                    document.getElementById('statGets').innerText = data.totalGets || 0;
+                    document.getElementById('statMemtable').innerText = data.memtableRecords || 0;
+                    document.getElementById('statSstables').innerText = data.sstableCount || 0;
+                    document.getElementById('statColumnar').innerText = data.totalColumnarRows || 0;
+                }
+                const cRes = await fetch('/api/v1/cluster/status');
+                if (cRes.ok) {
+                    const cData = await cRes.json();
+                    document.getElementById('raftRole').innerText = `Node: ${cData.nodeId} | Role: ${cData.role} | Term: ${cData.term}`;
+                }
+            } catch (e) {}
+        }
+
+        setInterval(fetchMetrics, 2000);
+        fetchMetrics();
+
+        async function execKvPut() {
+            const key = document.getElementById('kvKey').value;
+            const value = document.getElementById('kvVal').value;
+            const res = await fetch('/api/v1/kv/put', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({key, value})
+            });
+            const text = await res.text();
+            document.getElementById('kvOutput').innerText = `[PUT] Status: ${res.status}\n${text}`;
+            fetchMetrics();
+        }
+
+        async function execKvGet() {
+            const key = document.getElementById('kvKey').value;
+            const res = await fetch(`/api/v1/kv/get?key=${encodeURIComponent(key)}`);
+            const text = await res.text();
+            document.getElementById('kvOutput').innerText = `[GET] Status: ${res.status}\n${text}`;
+            fetchMetrics();
+        }
+
+        async function execKvDelete() {
+            const key = document.getElementById('kvKey').value;
+            const res = await fetch(`/api/v1/kv/delete?key=${encodeURIComponent(key)}`, {method: 'POST'});
+            const text = await res.text();
+            document.getElementById('kvOutput').innerText = `[DELETE] Status: ${res.status}\n${text}`;
+            fetchMetrics();
+        }
+
+        async function ingestSampleData() {
+            const table = document.getElementById('queryTable').value;
+            const res = await fetch('/api/v1/analytics/ingest', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({table})
+            });
+            const text = await res.text();
+            document.getElementById('queryOutput').innerText = `[INGEST] Status: ${res.status}\n${text}`;
+            fetchMetrics();
+        }
+
+        async function execQuery() {
+            const table = document.getElementById('queryTable').value;
+            const select = document.getElementById('querySelect').value;
+            const res = await fetch('/api/v1/analytics/query', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({table, select})
+            });
+            const text = await res.text();
+            document.getElementById('queryOutput').innerText = `[QUERY] Status: ${res.status}\n${text}`;
+        }
+    </script>
+</body>
+</html>
