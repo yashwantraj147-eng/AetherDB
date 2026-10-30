@@ -1,16 +1,16 @@
 <div align="center">
 
 # ⚡ AetherDB
-### High-Performance Distributed Key-Value & Columnar Storage Engine
-*Engineered in pure modern **Java 26** with Virtual Threads, Zero External Dependencies, and Microsecond-Latency SLAs.*
+### High-Performance Hybrid Key-Value & Columnar Storage Engine Prototype
+*Engineered in pure modern **Java (21–26)** with Virtual Threads, Zero External Dependencies, and Vectorized Aggregation.*
 
 <br/>
 
-[![Java 26](https://img.shields.io/badge/Java-26%2B-ED8B00?style=for-the-badge&logo=openjdk&logoColor=white)](https://openjdk.org/)
-[![Architecture](https://img.shields.io/badge/Architecture-HTAP%20(LSM%20%2B%20Columnar)-38BDF8?style=for-the-badge)](https://github.com/yashwantraj147-eng/AetherDB)
-[![Consensus](https://img.shields.io/badge/Consensus-Raft%20Protocol-10B981?style=for-the-badge)](https://github.com/yashwantraj147-eng/AetherDB)
-[![Throughput](https://img.shields.io/badge/Read%20Throughput-714%2C000%20IOPS-818CF8?style=for-the-badge)](https://github.com/yashwantraj147-eng/AetherDB)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
+[![Java CI](https://github.com/yashwantraj147-eng/AetherDB/actions/workflows/ci.yml/badge.svg)](https://github.com/yashwantraj147-eng/AetherDB/actions/workflows/ci.yml)
+[![Java 21+](https://img.shields.io/badge/Java-21%2B%20%2F%2026-ED8B00?style=for-the-badge&logo=openjdk&logoColor=white)](https://openjdk.org/)
+[![Architecture](https://img.shields.io/badge/Architecture-LSM%20%2B%20Columnar-38BDF8?style=for-the-badge)](docs/architecture.md)
+[![Consensus](https://img.shields.io/badge/Consensus-Raft%20(Prototype)-10B981?style=for-the-badge)](docs/architecture.md)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](LICENSE)
 
 <br/>
 
@@ -18,69 +18,72 @@
 <a href="#architecture">🏛️ Architecture</a> &bull;
 <a href="#quickstart">🚀 Quickstart</a> &bull;
 <a href="#web-studio">✨ Web Studio UI</a> &bull;
-<a href="#api-reference">📡 API Reference</a>
+<a href="#api-reference">📡 API Reference</a> &bull;
+<a href="docs/architecture.md">📖 Deep Internals Docs</a>
 
 </div>
 
 ---
 
-## 🌟 Executive Overview
+## 🌟 Overview
 
-**AetherDB** is an enterprise-grade **Hybrid Transactional and Analytical Processing (HTAP)** distributed storage engine designed to eliminate the architectural division between operational key-value stores and analytical column engines.
+**AetherDB** is an educational, high-performance prototype storage engine exploring the convergence between operational key-value stores and analytical column engines:
 
-Traditionally, systems require running two distinct databases:
-1. **Row OLTP Stores** (e.g., RocksDB, Cassandra) for point queries and streaming writes.
-2. **Columnar OLAP Engines** (e.g., ClickHouse, DuckDB, Parquet) for analytical batch aggregations.
+1. **Transactional LSM Tier**: Sequential append-only Write-Ahead Logging (WAL) with CRC32 frame checksums, memory skip-list tables (`ConcurrentSkipListMap`), sparse-indexed SSTables, and Kirsch-Mitzenmacher Bloom filtering.
+2. **Analytical Columnar Tier**: Adaptive Run-Length (RLE) and Dictionary encoding with block Min-Max zone-map statistics for vectorized predicate pushdown.
+3. **Consensus & Clustering (Prototype)**: In-memory Raft state machine simulation featuring term election timers and consistent hashing with 64 virtual nodes.
 
-AetherDB unifies both execution models into a single, cohesive engine powered by **Java 26 Virtual Threads** (`Thread.ofVirtual()`), custom binary serialization formats, and zero third-party framework overhead.
+Built in pure Java with **zero third-party runtime dependencies**, utilizing Java virtual threads (`Thread.ofVirtual()`) and custom binary serialization.
 
 ---
 
 ## 🏛️ System Architecture
 
+Detailed technical documentation and crash recovery protocols can be reviewed in [docs/architecture.md](docs/architecture.md).
+
 ```
                                   Client Applications / REST API / Studio UI
                                                       │
                                                       ▼
-                              ┌───────────────────────────────────────────────┐
-                              │     Virtual-Thread HTTP Gateway & Router      │
-                              └───────────────────────┬───────────────────────┘
-                                                      │
-                      ┌───────────────────────────────┴───────────────────────────────┐
-                      ▼                                                               ▼
-        [Key-Value Mutations & Point Reads]                                [Vectorized Analytical Scans]
- ┌──────────────────────────────────────────┐                    ┌─────────────────────────────────────────┐
- │            LSM-Tree Engine               │                    │        Columnar Analytics Engine        │
- │  • Append-Only Write-Ahead Log (WAL)     │                    │  • Adaptive Dictionary & RLE Encoders   │
- │  • CRC32 Framed Integrity Verification   │                    │  • Block-Level Min-Max Zone Maps        │
- │  • ConcurrentSkipListMap MemTable        │                    │  • Vectorized Batch Scanner             │
- │  • Multi-Level SSTables (.sst / .idx)    │                    │  • Loop-Unrolled SIMD Aggregations      │
- │  • Kirsch-Mitzenmacher Bloom Filters     │                    │  • Data Skipping Predicate Pushdown     │
- │  • Multi-Way Merge-Sort Compaction       │                    └────────────────────┬────────────────────┘
- └────────────────────┬─────────────────────┘                                         │
-                      │                                                               │
-                      └───────────────────────────────┬───────────────────────────────┘
-                                                      │
-                                                      ▼
-                                     ┌──────────────────────────────────┐
-                                     │   Raft Consensus State Machine   │
-                                     │   • Leader Election (Heartbeats) │
-                                     │   • Replicated AppendEntries Log │
-                                     │   • Consistent Hashing (vnodes)  │
-                                     └──────────────────────────────────┘
+                               ┌───────────────────────────────────────────────┐
+                               │     Virtual-Thread HTTP Gateway & Router      │
+                               └───────────────────────┬───────────────────────┘
+                                                       │
+                       ┌───────────────────────────────┴───────────────────────────────┐
+                       ▼                                                               ▼
+         [Key-Value Mutations & Point Reads]                                [Vectorized Analytical Scans]
+  ┌──────────────────────────────────────────┐                    ┌─────────────────────────────────────────┐
+  │            LSM-Tree Engine               │                    │        Columnar Analytics Engine        │
+  │  • Append-Only Write-Ahead Log (WAL)     │                    │  • Adaptive Dictionary & RLE Encoders   │
+  │  • CRC32 Framed Integrity Verification   │                    │  • Block-Level Min-Max Zone Maps        │
+  │  • ConcurrentSkipListMap MemTable        │                    │  • Vectorized Batch Scanner             │
+  │  • Multi-Level SSTables (.sst / .idx)    │                    │  • Loop-Unrolled Predicate Pushdown     │
+  │  • Kirsch-Mitzenmacher Bloom Filters     │                    │  • Data Skipping Predicate Evaluation   │
+  │  • Multi-Way Merge-Sort Compaction       │                    └────────────────────┬────────────────────┘
+  └────────────────────┬─────────────────────┘                                         │
+                       │                                                               │
+                       └───────────────────────────────┬───────────────────────────────┘
+                                                       │
+                                                       ▼
+                                      ┌──────────────────────────────────┐
+                                      │ Raft Consensus (Experimental)   │
+                                      │ • Leader Election (Heartbeats)   │
+                                      │ • Replicated AppendEntries Log   │
+                                      │ • Consistent Hashing (64 vnodes) │
+                                      └──────────────────────────────────┘
 ```
 
 ---
 
-## 📊 Performance Benchmarks
+## 📊 Benchmark Methodology & Results
 
-Audited on **AMD Ryzen / Intel x86_64** running JDK 26 using [AetherBenchmark](file:///c:/Users/yashw/Downloads/big%20data%20code/src/main/java/com/aetherdb/cli/AetherBenchmark.java):
+Microbenchmarks captured using `com.aetherdb.cli.AetherBenchmark` on an x86_64 host (OpenJDK 26, G1GC, 10,000 operation warm-up phase):
 
-| Workload | Concurrency | Total Operations | Latency / Time | Measured Throughput | Cache Hit Ratio |
+| Workload | Concurrency | Total Operations | Latency / Time | Measured Throughput | Operational Notes |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Concurrent Writes (`PUT`)** | 4 Virtual Threads | 80,000 Ops | 1,657 ms | **48,280 IOPS** | 100% (WAL + MemTable) |
-| **Point Lookups (`GET`)** | 4 Virtual Threads | 80,000 Ops | 112 ms | **714,285 IOPS** | **100.00%** |
-| **Vectorized Column Scan** | Batch size: 1024 | 1,000,000 Rows | 1.84 ms | **> 540M Rows / sec** | Zone-Map Block Skipping |
+| **Concurrent Writes (`PUT`)** | 4 Virtual Threads | 80,000 Ops | 1,657 ms | **~48,200 IOPS** | Append to WAL + MemTable insertion |
+| **In-Memory Point Lookups (`GET`)** | 4 Virtual Threads | 80,000 Ops | 112 ms | **~714,000 IOPS** | Warm lookups resolved from active MemTable |
+| **Vectorized Column Scan** | Batch size: 1024 | 1,000,000 Rows | 1.84 ms | **High-throughput** | Zone-Map block skipping evaluated |
 
 ---
 
@@ -95,22 +98,27 @@ Audited on **AMD Ryzen / Intel x86_64** running JDK 26 using [AetherBenchmark](f
   - Adaptive on-disk column compression: **Dictionary Encoding** for low-cardinality categorical data and **Run-Length Encoding (RLE)** for consecutive repeating sequences.
   - **Zone Map Indexing**: Block-level Min-Max statistics enabling queries like `WHERE latency > 50` to skip uncompressed blocks without disk I/O.
   - Vectorized evaluators for `SUM`, `AVG`, `MIN`, `MAX`, `COUNT`, and multi-predicate selection bitmasks.
-- **Distributed Consensus & Partitioning**:
+- **Distributed Consensus & Partitioning (Experimental Prototype)**:
   - Full **Raft Consensus Protocol** implementation with randomized election timers, heartbeat broadcasting, term verification, and replicated log state.
   - **Consistent Hash Ring** allocating 64 Virtual Nodes (`vnodes`) per physical node using MurmurHash3-32 for uniform key distribution.
-- **Zero-Dependency Native Architecture**:
-  - 100% pure modern Java 26.
-  - Embedded HTTP 1.1 server leveraging Java 26 Virtual Threads for non-blocking I/O at 100,000+ concurrent connections.
+- **Zero-Dependency Architecture**:
+  - Pure modern Java (21–26 compatible).
+  - Embedded HTTP 1.1 server leveraging Java Virtual Threads for non-blocking I/O.
 
 ---
 
 ## 🚀 Quickstart
 
 ### Prerequisites
-- **Java SE 26 (JDK 26)** or higher installed.
+- **Java SE 21+** or **Java SE 26** installed (`java -version`).
+- **Maven 3.8+** (optional, standard build script provided).
 
-### 1. Compile AetherDB
-- **Windows (PowerShell/CMD):**
+### 1. Build AetherDB
+- **Maven:**
+  ```bash
+  mvn clean compile
+  ```
+- **Windows (PowerShell / CMD without Maven):**
   ```cmd
   build.bat
   ```
@@ -123,13 +131,15 @@ Audited on **AMD Ryzen / Intel x86_64** running JDK 26 using [AetherBenchmark](f
 Verify all 6 test suites (Bloom Filters, RLE/Dictionary Encoders, ZoneMap Skipping, Hash Ring, LSM Engine, Columnar Scanners):
 ```cmd
 test.bat
+# or via Maven:
+mvn test
 ```
 
 ### 3. Launch the Server
 ```powershell
 .\run.ps1
 ```
-*(Or double-click `run.bat` on Windows / `./run.sh` on Linux)*
+*(Or run `run.bat` on Windows / `./run.sh` on Linux)*
 
 ---
 
@@ -143,7 +153,7 @@ http://127.0.0.1:8080/dashboard
 The embedded Studio features:
 1. **Telemetry & Live Sparkline**: Real-time IOPS graph updated on a live 2000ms ticker, MemTable memory bytes, and Bloom filter miss savings.
 2. **LSM Key-Value Explorer**: Interactive CRUD operations (`PUT`, `GET`, `DELETE`) with formatted JSON terminal views.
-3. **Vectorized Analytics Studio**: One-click synthetic IoT telemetry generator, preset analytical queries (`COUNT(*)`, `AVG(latency)`, `MAX(latency)`), and execution timing badges (`0.25 ms`).
+3. **Vectorized Analytics Studio**: One-click synthetic IoT telemetry generator, preset analytical queries (`COUNT(*)`, `AVG(latency)`, `MAX(latency)`), and execution timing badges.
 4. **Raft & Shards Inspector**: Interactive Consistent Hash Ring visualizer displaying MurmurHash3 assignments and Virtual Node partitions in real time.
 
 ---
@@ -193,4 +203,5 @@ The embedded Studio features:
 ---
 
 ## 📜 License
-Distributed under the **MIT License**.
+
+[MIT](LICENSE) © 2026 Yashwant Raj
