@@ -132,3 +132,4 @@ public class ColumnarStorageTest {
         assertEquals(2, chunks.get(2).getRowCount());
     }
 }
+

@@ -76,3 +76,4 @@ flowchart TD
 ## 5. Summary
 
 This design guarantees that when fully implemented, AetherDB will provide strict linearizable read/write semantics and Byzantine-free crash fault tolerance ($2f + 1$ node quorum) with zero data loss across network partitions.
+

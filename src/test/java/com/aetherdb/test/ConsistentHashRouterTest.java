@@ -54,3 +54,4 @@ public class ConsistentHashRouterTest {
         assertThrows(IllegalStateException.class, () -> router.routeKey("any_key"));
     }
 }
+

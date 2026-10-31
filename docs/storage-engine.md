@@ -44,3 +44,4 @@ Reads (`get(byte[] key)`) do not rely on insertion order or flush completion ord
 
 ## 3. Data Safety & Defensive Immutability
 All internal keys and values exposed through public APIs or stored in `DataRecord` are defensively copied upon construction and getter access (`key.clone()`), preventing external callers from mutating keys after insertion into sorted skip-lists, bloom filters, or block caches.
+

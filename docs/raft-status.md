@@ -24,3 +24,4 @@ The consensus subsystem (`com.aetherdb.consensus.raft`) contains an **experiment
 - Raft term, vote, and replicated log state are maintained in memory; they are not yet persisted to disk across node reboots.
 - Log payloads currently exchange heartbeat metadata; full payload batch streaming, previous-log conflict truncation, and `nextIndex`/`matchIndex` replication vectors are not yet complete.
 - For complete architecture and specifications for future distributed Raft replication, see [`docs/raft-design.md`](raft-design.md).
+

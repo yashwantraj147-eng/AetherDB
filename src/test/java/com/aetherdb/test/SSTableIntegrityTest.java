@@ -108,3 +108,4 @@ public class SSTableIntegrityTest {
         assertEquals(0, sstables != null ? sstables.length : 0);
     }
 }
+

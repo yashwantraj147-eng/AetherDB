@@ -34,3 +34,4 @@ Tombstones (`RecordType.DELETE`) are only discarded during compaction when `isDe
    ```
    Any newly installed SSTables created by concurrent flushes during the compaction process are **never clobbered or lost**.
 4. **Reader Reference Counting**: Each `SSTableReader` maintains an atomic reference count. Obsolete compacted files remain open until all active point readers and iterators complete, preventing `FileChannel` closed exceptions.
+

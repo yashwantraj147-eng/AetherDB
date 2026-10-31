@@ -52,3 +52,4 @@ When `groupByColumns` are specified in `QueryRequest`:
 2. Group keys are mapped in a `LinkedHashMap<GroupKey, List<AggregateAccumulator>>`.
 3. Aggregate expressions accumulate independently within each group bucket.
 4. Output rows contain `[groupByColumns..., selectExpressions...]`.
+

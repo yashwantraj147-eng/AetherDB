@@ -56,3 +56,4 @@ AetherDB loads its settings from property files, default settings, and explicit 
 | `raft.election.timeout.max.ms` | `300` | Maximum randomized election timeout in milliseconds. |
 | `raft.heartbeat.interval.ms` | `50` | Interval between leader heartbeat broadcasts. |
 | `cluster.vnodes.per.node` | `64` | Virtual nodes allocated per physical instance in the consistent hash ring. |
+

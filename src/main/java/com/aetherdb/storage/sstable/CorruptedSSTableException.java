@@ -16,3 +16,4 @@ public class CorruptedSSTableException extends IOException {
         super(message, cause);
     }
 }
+

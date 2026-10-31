@@ -108,3 +108,4 @@ Returns node ID, consensus role, and partition ring topology.
 
 #### `GET /api/v1/metrics`
 Returns real-time engine telemetry (puts, gets, hits, misses, SSTable counts, row counts).
+

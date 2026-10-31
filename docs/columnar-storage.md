@@ -36,3 +36,4 @@ In AetherDB V2:
 - Key-Value writes (`put`, `delete`) write to the LSM engine (WAL, MemTable, SSTables).
 - Analytical data is ingested via `ingestColumnar()`.
 - Updates to Key-Value data do not automatically reflect in the columnar store without an explicit ETL / CDC event log mechanism.
+

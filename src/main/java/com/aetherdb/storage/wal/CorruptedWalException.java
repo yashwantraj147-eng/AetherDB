@@ -16,3 +16,4 @@ public class CorruptedWalException extends IOException {
         super(message, cause);
     }
 }
+

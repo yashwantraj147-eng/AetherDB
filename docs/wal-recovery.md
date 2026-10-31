@@ -53,3 +53,4 @@ Upon database restart:
    - The maximum sequence number across all recovered WAL records and all existing SSTables is identified.
    - `sequenceNumberGenerator.set(maxSeq + 1)`.
    - Sequence numbers remain strictly monotonic across restart.
+

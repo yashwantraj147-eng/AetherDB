@@ -44,3 +44,4 @@ All notable changes and architectural repairs in **AetherDB V2** are documented 
 - **Defensive Immutability**: Implemented defensive cloning of key and value byte arrays in `DataRecord`.
 - **Unified Java 21 Build System**: Aligned Maven compiler, Windows scripts (`build.bat`, `build.ps1`, `test.bat`, `run.bat`), Unix scripts (`build.sh`, `test.sh`, `run.sh`), and GitHub Actions CI workflow to Java 21 canonical build.
 - **Comprehensive Automated Regression Tests**: Created 25 automated JUnit 5 unit and integration tests across 8 categories with 100% pass rate.
+
