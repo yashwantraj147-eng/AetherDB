@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
-if [ ! -f "bin/com/aetherdb/test/TestRunner.class" ]; then
-    echo "Building AetherDB test suite..."
-    ./build.sh
+echo "========================================================"
+echo "  AetherDB Verification & Regression Test Suite"
+echo "========================================================"
+
+if command -v mvn &> /dev/null; then
+    mvn clean test
+    exit $?
 fi
 
-echo "Running AetherDB Verification Test Suite..."
-java -cp bin com.aetherdb.test.TestRunner
+echo "[ERROR] Maven executable (mvn) not found in PATH!"
+exit 1

@@ -10,8 +10,14 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Full Raft Consensus state machine implementing Leader Election,
- * Log Replication, Heartbeat broadcasting, and State Machine Application.
+ * Experimental Raft Consensus simulation and prototype.
+ *
+ * Current Status & Known Scope:
+ * - Implements Leader Election and Heartbeat RPC message exchange protocol simulation.
+ * - This version is an in-memory consensus prototype intended for cluster simulation.
+ * - Storage engine Key-Value operations currently execute on the local storage engine;
+ *   writes are not yet quorum-replicated or durable across distributed Raft log partitions.
+ * - For a full production Raft architecture specification, see docs/raft-design.md.
  */
 public class RaftNode implements AutoCloseable {
 
@@ -49,9 +55,9 @@ public class RaftNode implements AutoCloseable {
         if (peers.isEmpty()) {
             currentRole = RaftRole.LEADER;
             currentLeaderId = nodeId;
-        } else {
+        } else if (config.isRaftEnabled()) {
             // Schedule randomized election timer check
-            long checkInterval = config.getRaftElectionMinMs() / 2;
+            long checkInterval = Math.max(20, config.getRaftElectionMinMs() / 2);
             timerExecutor.scheduleWithFixedDelay(this::checkElectionTimeout,
                     checkInterval, checkInterval, TimeUnit.MILLISECONDS);
 
@@ -75,7 +81,9 @@ public class RaftNode implements AutoCloseable {
         if (!running || currentRole == RaftRole.LEADER) return;
 
         long elapsed = System.currentTimeMillis() - lastHeartbeatTimestamp;
-        long timeout = config.getRaftElectionMinMs() + random.nextInt(config.getRaftElectionMaxMs() - config.getRaftElectionMinMs());
+        int minTimeout = config.getRaftElectionMinMs();
+        int maxTimeout = Math.max(minTimeout + 10, config.getRaftElectionMaxMs());
+        long timeout = minTimeout + random.nextInt(maxTimeout - minTimeout);
 
         if (elapsed >= timeout) {
             startElection();
@@ -107,8 +115,10 @@ public class RaftNode implements AutoCloseable {
                         stepDownToFollower(reply.getTerm());
                         return;
                     }
-                    if (currentRole == RaftRole.CANDIDATE && reply.getTerm() == term && reply.isVoteGranted()) {
-                        if (votes.incrementAndGet() >= quorum) {
+
+                    if (currentRole == RaftRole.CANDIDATE && reply.isVoteGranted() && reply.getTerm() == term) {
+                        int currentVotes = votes.incrementAndGet();
+                        if (currentVotes >= quorum && currentRole == RaftRole.CANDIDATE) {
                             becomeLeader();
                         }
                     }
@@ -118,34 +128,26 @@ public class RaftNode implements AutoCloseable {
     }
 
     private synchronized void becomeLeader() {
-        if (currentRole != RaftRole.CANDIDATE) return;
         currentRole = RaftRole.LEADER;
         currentLeaderId = nodeId;
-        state.initLeaderState(new ArrayList<>(peers.keySet()));
-        broadcastHeartbeats();
+        broadcastHeartbeatsIfLeader();
     }
 
-    private synchronized void stepDownToFollower(long newTerm) {
+    private synchronized void stepDownToFollower(long term) {
         currentRole = RaftRole.FOLLOWER;
-        state.setCurrentTerm(newTerm);
+        state.setCurrentTerm(term);
         state.setVotedFor(null);
+        currentLeaderId = null;
         lastHeartbeatTimestamp = System.currentTimeMillis();
     }
 
-    /**
-     * Broadcasts heartbeats to all cluster peers if this node is leader.
-     */
-    private void broadcastHeartbeatsIfLeader() {
-        if (currentRole == RaftRole.LEADER) {
-            broadcastHeartbeats();
-        }
-    }
+    private synchronized void broadcastHeartbeatsIfLeader() {
+        if (!running || currentRole != RaftRole.LEADER) return;
 
-    private synchronized void broadcastHeartbeats() {
         long term = state.getCurrentTerm();
-        long commitIndex = state.getCommitIndex();
         long lastLogIndex = state.getLastLogIndex();
         long lastLogTerm = state.getLastLogTerm();
+        long commitIndex = state.getCommitIndex();
 
         for (PeerClient peer : peers.values()) {
             AppendEntriesArgs args = new AppendEntriesArgs(term, nodeId, lastLogIndex, lastLogTerm, Collections.emptyList(), commitIndex);
@@ -198,14 +200,12 @@ public class RaftNode implements AutoCloseable {
         currentLeaderId = args.getLeaderId();
         lastHeartbeatTimestamp = System.currentTimeMillis();
 
-        // If entries are attached, append them to local state log
         if (!args.getEntries().isEmpty()) {
             for (LogPayload entry : args.getEntries()) {
                 state.getLog().add(entry);
             }
         }
 
-        // Apply committed entries to local storage engine
         if (args.getLeaderCommit() > state.getCommitIndex()) {
             long newCommit = Math.min(args.getLeaderCommit(), state.getLastLogIndex());
             state.setCommitIndex(newCommit);

@@ -1,6 +1,5 @@
 package com.aetherdb.storage.wal;
 
-import com.aetherdb.common.BinaryUtils;
 import com.aetherdb.model.DataRecord;
 
 import java.nio.ByteBuffer;
@@ -9,9 +8,11 @@ import java.util.zip.CRC32;
 /**
  * Encapsulates a single framed binary record in the Write-Ahead Log.
  * Binary format:
- * [CRC32 Checksum (4B)][Payload Length (4B)][Serialized DataRecord]
+ * [CRC32 Checksum (4B)][Payload Length (4B)][Serialized DataRecord Payload]
  */
 public class LogEntry {
+
+    public static final int MAX_PAYLOAD_SIZE = 64 * 1024 * 1024; // 64 MB maximum frame size
 
     private final long crc32;
     private final DataRecord record;
@@ -61,9 +62,9 @@ public class LogEntry {
 
     /**
      * Reads and validates a WAL frame from a ByteBuffer.
-     * Returns null if not enough bytes are available for the header.
+     * Returns null if not enough bytes are available for the header or full payload.
      */
-    public static LogEntry deserialize(ByteBuffer buffer) {
+    public static LogEntry deserialize(ByteBuffer buffer) throws CorruptedWalException {
         if (buffer.remaining() < 8) {
             return null;
         }
@@ -72,16 +73,16 @@ public class LogEntry {
         int expectedCrc = buffer.getInt();
         int payloadLen = buffer.getInt();
 
-        if (payloadLen <= 0 || payloadLen > 128 * 1024 * 1024) {
-            throw new IllegalStateException("Corrupt WAL frame payload length: " + payloadLen);
+        if (payloadLen <= 0 || payloadLen > MAX_PAYLOAD_SIZE) {
+            buffer.position(startPos);
+            throw new CorruptedWalException("Corrupt WAL frame payload length: " + payloadLen);
         }
 
         if (buffer.remaining() < payloadLen) {
             buffer.position(startPos);
-            return null; // Partial frame at end of file
+            return null; // Partial frame at end of buffer
         }
 
-        int payloadOffset = buffer.position();
         byte[] payloadBytes = new byte[payloadLen];
         buffer.get(payloadBytes);
 
@@ -90,7 +91,8 @@ public class LogEntry {
         long actualCrc = crc.getValue();
 
         if ((int) actualCrc != expectedCrc) {
-            throw new IllegalStateException("WAL CRC32 mismatch! Expected=" + expectedCrc + ", Actual=" + (int) actualCrc);
+            buffer.position(startPos);
+            throw new CorruptedWalException("WAL CRC32 mismatch! Expected=" + expectedCrc + ", Actual=" + (int) actualCrc);
         }
 
         ByteBuffer payloadBuffer = ByteBuffer.wrap(payloadBytes);

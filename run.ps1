@@ -1,11 +1,10 @@
-Write-Host "Starting AetherDB Server..." -ForegroundColor Cyan
-
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-
-if (-not (Test-Path "$scriptDir/bin/com/aetherdb/AetherServer.class")) {
-    Write-Host "AetherDB is not built yet. Compiling..." -ForegroundColor Yellow
-    & "$scriptDir/build.ps1"
+$jarFile = Join-Path $PSScriptRoot "target\aetherdb-2.0.0-SNAPSHOT.jar"
+if (-not (Test-Path $jarFile)) {
+    Write-Host "[INFO] Packaging AetherDB executable jar..." -ForegroundColor Cyan
+    & "$PSScriptRoot\build.ps1"
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
-& java -cp "$scriptDir/bin" com.aetherdb.AetherServer "$scriptDir/config/aether-cluster.properties"
+Write-Host "Starting AetherDB Server..." -ForegroundColor Green
+$configPath = Join-Path $PSScriptRoot "config\aether-cluster.properties"
+& java -jar $jarFile $configPath

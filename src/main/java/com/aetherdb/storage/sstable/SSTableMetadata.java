@@ -7,6 +7,7 @@ import java.nio.ByteBuffer;
 
 /**
  * Metadata and footer descriptor for an immutable SSTable.
+ * Enforces defensive copying of boundary keys and validates fields on deserialization.
  */
 public class SSTableMetadata {
 
@@ -32,8 +33,8 @@ public class SSTableMetadata {
                            long createdAt) {
         this.tableId = tableId;
         this.level = level;
-        this.minKey = minKey;
-        this.maxKey = maxKey;
+        this.minKey = (minKey != null) ? minKey.clone() : null;
+        this.maxKey = (maxKey != null) ? maxKey.clone() : null;
         this.minSequenceNumber = minSequenceNumber;
         this.maxSequenceNumber = maxSequenceNumber;
         this.recordCount = recordCount;
@@ -47,8 +48,8 @@ public class SSTableMetadata {
 
     public long getTableId() { return tableId; }
     public int getLevel() { return level; }
-    public byte[] getMinKey() { return minKey; }
-    public byte[] getMaxKey() { return maxKey; }
+    public byte[] getMinKey() { return (minKey != null) ? minKey.clone() : null; }
+    public byte[] getMaxKey() { return (maxKey != null) ? maxKey.clone() : null; }
     public long getMinSequenceNumber() { return minSequenceNumber; }
     public long getMaxSequenceNumber() { return maxSequenceNumber; }
     public long getRecordCount() { return recordCount; }
@@ -60,6 +61,7 @@ public class SSTableMetadata {
     public long getCreatedAt() { return createdAt; }
 
     public boolean couldContainKey(byte[] key) {
+        if (key == null) return false;
         if (minKey != null && BinaryUtils.compareBytes(key, minKey) < 0) return false;
         if (maxKey != null && BinaryUtils.compareBytes(key, maxKey) > 0) return false;
         return true;
@@ -96,24 +98,48 @@ public class SSTableMetadata {
     }
 
     /**
-     * Deserializes metadata footer from ByteBuffer.
+     * Deserializes metadata footer from ByteBuffer with integrity checks.
      */
-    public static SSTableMetadata deserialize(ByteBuffer buf) {
+    public static SSTableMetadata deserialize(ByteBuffer buf) throws CorruptedSSTableException {
+        if (buf.remaining() < 50) {
+            throw new CorruptedSSTableException("SSTable footer too small: " + buf.remaining());
+        }
+
         int magic = buf.getInt();
         if (magic != Constants.SSTABLE_MAGIC) {
-            throw new IllegalStateException("Corrupt SSTable magic: " + Integer.toHexString(magic));
+            throw new CorruptedSSTableException("Corrupt SSTable magic: 0x" + Integer.toHexString(magic));
         }
         short version = buf.getShort();
+        if (version != Constants.SSTABLE_VERSION) {
+            throw new CorruptedSSTableException("Unsupported SSTable version: " + version);
+        }
+
         long tableId = buf.getLong();
         int level = buf.getInt();
 
         int minKeyLen = BinaryUtils.readVarInt(buf);
+        if (minKeyLen < 0 || minKeyLen > 65536) {
+            throw new CorruptedSSTableException("Invalid SSTable minKey length: " + minKeyLen);
+        }
         byte[] minKey = minKeyLen > 0 ? new byte[minKeyLen] : null;
-        if (minKey != null) buf.get(minKey);
+        if (minKey != null) {
+            if (buf.remaining() < minKeyLen) throw new CorruptedSSTableException("Buffer underflow reading minKey");
+            buf.get(minKey);
+        }
 
         int maxKeyLen = BinaryUtils.readVarInt(buf);
+        if (maxKeyLen < 0 || maxKeyLen > 65536) {
+            throw new CorruptedSSTableException("Invalid SSTable maxKey length: " + maxKeyLen);
+        }
         byte[] maxKey = maxKeyLen > 0 ? new byte[maxKeyLen] : null;
-        if (maxKey != null) buf.get(maxKey);
+        if (maxKey != null) {
+            if (buf.remaining() < maxKeyLen) throw new CorruptedSSTableException("Buffer underflow reading maxKey");
+            buf.get(maxKey);
+        }
+
+        if (buf.remaining() < 56) {
+            throw new CorruptedSSTableException("Buffer underflow reading SSTable metadata numeric fields");
+        }
 
         long minSeq = buf.getLong();
         long maxSeq = buf.getLong();
@@ -124,6 +150,10 @@ public class SSTableMetadata {
         long bloomOffset = buf.getLong();
         int bloomLength = buf.getInt();
         long createdAt = buf.getLong();
+
+        if (recordCount < 0 || dataSize < 0 || indexOffset < 0 || indexLength < 0 || bloomOffset < 0 || bloomLength < 0) {
+            throw new CorruptedSSTableException("Negative offset or length in SSTable metadata");
+        }
 
         return new SSTableMetadata(tableId, level, minKey, maxKey, minSeq, maxSeq,
                 recordCount, dataSize, indexOffset, indexLength, bloomOffset, bloomLength, createdAt);

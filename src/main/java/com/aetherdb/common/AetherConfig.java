@@ -11,7 +11,7 @@ import java.util.*;
 
 /**
  * Production-grade configuration loader and validator for AetherDB.
- * Supports property files, environment variable overrides, and dynamic peer discovery.
+ * Supports property files, default settings, security controls, and directory validation.
  */
 public class AetherConfig {
 
@@ -19,7 +19,7 @@ public class AetherConfig {
 
     public enum WalSyncMode {
         IMMEDIATE, // Synchronous fsync after every write (highest durability)
-        PERIODIC,  // Background background flush on timer (high performance)
+        PERIODIC,  // Background flush on timer
         OS_BUFFER  // Delegated to OS page cache
     }
 
@@ -85,6 +85,7 @@ public class AetherConfig {
         props.setProperty("columnar.dictionary.threshold.ratio", "0.70");
         props.setProperty("columnar.vectorized.batch.size", "1024");
 
+        props.setProperty("raft.enabled", "false");
         props.setProperty("raft.election.timeout.min.ms", "150");
         props.setProperty("raft.election.timeout.max.ms", "300");
         props.setProperty("raft.heartbeat.interval.ms", "50");
@@ -92,6 +93,10 @@ public class AetherConfig {
 
         props.setProperty("cluster.vnodes.per.node", "64");
         props.setProperty("server.dashboard.enabled", "true");
+        props.setProperty("server.auth.enabled", "false");
+        props.setProperty("server.auth.token", "");
+        props.setProperty("server.cors.allowed.origins", "*");
+        props.setProperty("server.max.request.body.bytes", "10485760"); // 10 MB default
         props.setProperty("server.metrics.history.retention.seconds", "3600");
     }
 
@@ -146,12 +151,18 @@ public class AetherConfig {
     public int getVectorizedBatchSize() { return Integer.parseInt(props.getProperty("columnar.vectorized.batch.size")); }
     public double getDictionaryThresholdRatio() { return Double.parseDouble(props.getProperty("columnar.dictionary.threshold.ratio")); }
 
+    public boolean isRaftEnabled() { return Boolean.parseBoolean(props.getProperty("raft.enabled")); }
     public int getRaftElectionMinMs() { return Integer.parseInt(props.getProperty("raft.election.timeout.min.ms")); }
     public int getRaftElectionMaxMs() { return Integer.parseInt(props.getProperty("raft.election.timeout.max.ms")); }
     public int getRaftHeartbeatMs() { return Integer.parseInt(props.getProperty("raft.heartbeat.interval.ms")); }
 
     public int getVNodesPerNode() { return Integer.parseInt(props.getProperty("cluster.vnodes.per.node")); }
     public boolean isDashboardEnabled() { return Boolean.parseBoolean(props.getProperty("server.dashboard.enabled")); }
+
+    public boolean isAuthEnabled() { return Boolean.parseBoolean(props.getProperty("server.auth.enabled")); }
+    public String getAuthToken() { return props.getProperty("server.auth.token", ""); }
+    public String getCorsAllowedOrigins() { return props.getProperty("server.cors.allowed.origins", "*"); }
+    public int getMaxRequestBodyBytes() { return Integer.parseInt(props.getProperty("server.max.request.body.bytes")); }
 
     public void setProperty(String key, String value) {
         props.setProperty(key, value);

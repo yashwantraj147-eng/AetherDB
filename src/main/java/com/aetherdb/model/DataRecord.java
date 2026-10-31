@@ -6,9 +6,12 @@ import java.nio.ByteBuffer;
 import java.util.Arrays;
 
 /**
- * Core record unit for AetherDB LSM-Tree Key-Value engine.
+ * Core immutable record unit for AetherDB LSM-Tree Key-Value engine.
  * Records are sorted lexicographically by key; ties are broken by sequenceNumber descending
  * so that the most recent record version is evaluated first.
+ *
+ * Implements defensive copying for key and value byte arrays to guarantee immutability
+ * and prevent data corruption in sorted collections and caches.
  */
 public class DataRecord implements Comparable<DataRecord> {
 
@@ -19,11 +22,14 @@ public class DataRecord implements Comparable<DataRecord> {
     private final RecordType type;
 
     public DataRecord(byte[] key, byte[] value, long timestamp, long sequenceNumber, RecordType type) {
-        this.key = key;
-        this.value = (value != null) ? value : Constants.TOMBSTONE_PAYLOAD;
+        if (key == null) {
+            throw new IllegalArgumentException("Key cannot be null");
+        }
+        this.key = key.clone();
+        this.value = (value != null) ? value.clone() : Constants.TOMBSTONE_PAYLOAD;
         this.timestamp = timestamp;
         this.sequenceNumber = sequenceNumber;
-        this.type = type;
+        this.type = (type != null) ? type : RecordType.PUT;
     }
 
     public static DataRecord put(byte[] key, byte[] value, long seqNum) {
@@ -42,8 +48,20 @@ public class DataRecord implements Comparable<DataRecord> {
         return delete(key.getBytes(Constants.DEFAULT_CHARSET), seqNum);
     }
 
-    public byte[] getKey() { return key; }
-    public byte[] getValue() { return value; }
+    /**
+     * Returns a defensive copy of the key.
+     */
+    public byte[] getKey() {
+        return key.clone();
+    }
+
+    /**
+     * Returns a defensive copy of the value.
+     */
+    public byte[] getValue() {
+        return value.clone();
+    }
+
     public long getTimestamp() { return timestamp; }
     public long getSequenceNumber() { return sequenceNumber; }
     public RecordType getType() { return type; }
@@ -85,9 +103,15 @@ public class DataRecord implements Comparable<DataRecord> {
         byte typeCode = buffer.get();
         RecordType type = RecordType.fromCode(typeCode);
         int keyLen = BinaryUtils.readVarInt(buffer);
+        if (keyLen < 0 || keyLen > 64 * 1024 * 1024) {
+            throw new IllegalArgumentException("Invalid key length in record: " + keyLen);
+        }
         byte[] key = new byte[keyLen];
         buffer.get(key);
         int valLen = BinaryUtils.readVarInt(buffer);
+        if (valLen < 0 || valLen > 128 * 1024 * 1024) {
+            throw new IllegalArgumentException("Invalid value length in record: " + valLen);
+        }
         byte[] value = new byte[valLen];
         buffer.get(value);
         long timestamp = buffer.getLong();

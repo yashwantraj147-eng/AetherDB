@@ -12,8 +12,8 @@ import java.net.InetSocketAddress;
 import java.util.concurrent.Executors;
 
 /**
- * High-performance embedded HTTP Gateway for AetherDB powered by Java 26 Virtual Threads.
- * Supports tens of thousands of concurrent client connections with zero external dependencies.
+ * Embedded HTTP Gateway for AetherDB powered by Java Virtual Threads.
+ * Supports concurrent client connections with JSON REST and dashboard endpoints.
  */
 public class HttpApiServer implements AutoCloseable {
 
@@ -23,12 +23,18 @@ public class HttpApiServer implements AutoCloseable {
     public HttpApiServer(AetherConfig config, StorageEngine storageEngine,
                          RaftNode raftNode, ConsistentHashRouter router) throws IOException {
         this.port = config.getNodePort();
-        this.server = HttpServer.create(new InetSocketAddress(config.getNodeHost(), port), 0);
+        String host = config.getNodeHost();
+
+        if ("0.0.0.0".equals(host) && !config.isAuthEnabled()) {
+            System.err.println("WARNING: Server bound to 0.0.0.0 with authentication disabled! Endpoints are open to external network access.");
+        }
+
+        this.server = HttpServer.create(new InetSocketAddress(host, port), 0);
 
         // Bind virtual thread executor for lightweight non-blocking connection handling
         this.server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
 
-        RestApiHandler restHandler = new RestApiHandler(storageEngine, raftNode, router);
+        RestApiHandler restHandler = new RestApiHandler(config, storageEngine, raftNode, router);
         server.createContext("/api/", restHandler);
 
         if (config.isDashboardEnabled()) {
@@ -43,7 +49,11 @@ public class HttpApiServer implements AutoCloseable {
 
     public void start() {
         server.start();
-        System.out.println("⚡ AetherDB HTTP Server listening on port " + port + " (Virtual Threads Enabled)");
+        System.out.println("⚡ AetherDB HTTP Server listening on port " + getPort() + " (Virtual Threads Enabled)");
+    }
+
+    public int getPort() {
+        return server.getAddress().getPort();
     }
 
     @Override

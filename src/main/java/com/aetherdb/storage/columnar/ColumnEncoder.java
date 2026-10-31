@@ -5,11 +5,13 @@ import com.aetherdb.model.ColumnType;
 import com.aetherdb.model.ColumnValue;
 
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 
 /**
  * Adaptive Column Encoder that selects the optimal compression codec
  * (Dictionary, Run-Length Encoding, or Raw) based on cardinality and value repetition.
+ * Uses exact capacity allocation to prevent buffer overflow with long strings or large columns.
  */
 public class ColumnEncoder {
 
@@ -41,7 +43,7 @@ public class ColumnEncoder {
      * Encodes a list of column values into a compressed binary representation.
      */
     public byte[] encode(List<ColumnValue> values) {
-        if (values.isEmpty()) {
+        if (values == null || values.isEmpty()) {
             return new byte[]{Codec.RAW.getId(), 0, 0, 0, 0};
         }
 
@@ -70,8 +72,28 @@ public class ColumnEncoder {
         return encodeRaw(values);
     }
 
+    private int getValueByteSize(ColumnValue val) {
+        if (val == null || val.isNull()) return 0;
+        return switch (type) {
+            case INT32 -> 4;
+            case INT64, TIMESTAMP, FLOAT64 -> 8;
+            case BOOLEAN -> 1;
+            case STRING -> {
+                String s = val.asString();
+                if (s == null) yield 0;
+                byte[] bytes = s.getBytes(StandardCharsets.UTF_8);
+                yield 5 + bytes.length; // 5 bytes max for VarInt length + payload bytes
+            }
+        };
+    }
+
     private byte[] encodeRaw(List<ColumnValue> values) {
-        ByteBuffer buf = ByteBuffer.allocate(values.size() * 16 + 64);
+        int capacity = 1 + 4; // Codec (1B) + RowCount (4B)
+        for (ColumnValue val : values) {
+            capacity += 1 + getValueByteSize(val); // notNull flag (1B) + value
+        }
+
+        ByteBuffer buf = ByteBuffer.allocate(capacity + 32);
         buf.put(Codec.RAW.getId());
         buf.putInt(values.size());
 
@@ -97,7 +119,13 @@ public class ColumnEncoder {
             dictMap.put(dictionary.get(i), i);
         }
 
-        ByteBuffer buf = ByteBuffer.allocate(values.size() * 4 + dictionary.size() * 16 + 64);
+        int capacity = 1 + 4 + 5; // Codec (1B) + RowCount (4B) + VarInt(dictSize)
+        for (ColumnValue dictVal : dictionary) {
+            capacity += 1 + getValueByteSize(dictVal);
+        }
+        capacity += values.size() * 5; // max 5 bytes per VarInt index
+
+        ByteBuffer buf = ByteBuffer.allocate(capacity + 64);
         buf.put(Codec.DICTIONARY.getId());
         buf.putInt(values.size());
 
@@ -125,10 +153,6 @@ public class ColumnEncoder {
     }
 
     private byte[] encodeRLE(List<ColumnValue> values) {
-        ByteBuffer buf = ByteBuffer.allocate(values.size() * 12 + 64);
-        buf.put(Codec.RLE.getId());
-        buf.putInt(values.size());
-
         List<Integer> runLengths = new ArrayList<>();
         List<ColumnValue> runValues = new ArrayList<>();
 
@@ -148,6 +172,15 @@ public class ColumnEncoder {
         }
         runLengths.add(currentLen);
         runValues.add(currentVal);
+
+        int capacity = 1 + 4 + 5; // Codec + RowCount + VarInt(runCount)
+        for (int i = 0; i < runValues.size(); i++) {
+            capacity += 5 + 1 + getValueByteSize(runValues.get(i)); // VarInt(runLen) + notNull + value
+        }
+
+        ByteBuffer buf = ByteBuffer.allocate(capacity + 64);
+        buf.put(Codec.RLE.getId());
+        buf.putInt(values.size());
 
         BinaryUtils.writeVarInt(buf, runValues.size());
         for (int i = 0; i < runValues.size(); i++) {

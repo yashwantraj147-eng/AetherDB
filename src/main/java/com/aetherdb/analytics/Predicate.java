@@ -5,6 +5,7 @@ import com.aetherdb.storage.columnar.ZoneMap;
 
 /**
  * Filter predicate condition over a column.
+ * Handles boundary conditions accurately for inclusive and exclusive comparisons.
  */
 public class Predicate {
 
@@ -26,13 +27,16 @@ public class Predicate {
      * Checks if this entire chunk can be skipped using the ZoneMap without scanning rows.
      */
     public boolean canSkipChunk(ZoneMap zoneMap) {
-        if (zoneMap == null) return false;
+        if (zoneMap == null || targetValue == null) return false;
 
         return switch (operator) {
             case EQUALS -> zoneMap.canSkipEquals(targetValue);
-            case GREATER_THAN, GREATER_THAN_OR_EQUALS -> zoneMap.canSkipGreaterThan(targetValue);
-            case LESS_THAN, LESS_THAN_OR_EQUALS -> zoneMap.canSkipLessThan(targetValue);
-            default -> false;
+            case NOT_EQUALS -> zoneMap.canSkipNotEquals(targetValue);
+            case GREATER_THAN -> zoneMap.canSkipGreaterThan(targetValue);
+            case GREATER_THAN_OR_EQUALS -> zoneMap.canSkipGreaterThanOrEquals(targetValue);
+            case LESS_THAN -> zoneMap.canSkipLessThan(targetValue);
+            case LESS_THAN_OR_EQUALS -> zoneMap.canSkipLessThanOrEquals(targetValue);
+            case LIKE -> false;
         };
     }
 }

@@ -1,37 +1,18 @@
 Write-Host "========================================================" -ForegroundColor Cyan
-Write-Host "  AetherDB Build Script - Java 26 Native Compiler" -ForegroundColor Cyan
+Write-Host "  AetherDB Build Script - Maven Java 21 Canonical Build" -ForegroundColor Cyan
 Write-Host "========================================================" -ForegroundColor Cyan
 
-if (-not (Test-Path "bin")) {
-    New-Item -ItemType Directory -Path "bin" | Out-Null
-}
-
-$mainSources = Get-ChildItem -Recurse -Filter *.java -Path "src/main/java" | ForEach-Object { $_.FullName }
-$testSources = @()
-if (Test-Path "src/test/java") {
-    $testSources = Get-ChildItem -Recurse -Filter *.java -Path "src/test/java" | ForEach-Object { $_.FullName }
-}
-
-$allSources = @($mainSources) + @($testSources)
-
-if ($null -eq $allSources -or $allSources.Count -eq 0) {
-    Write-Error "No Java source files found!"
-    exit 1
-}
-
-Write-Host "Compiling $($allSources.Count) AetherDB source files with javac 26..." -ForegroundColor Yellow
-& javac -d bin --release 26 $allSources
-
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "[BUILD FAILED] Compilation error." -ForegroundColor Red
+$mvnCmd = Get-Command mvn -ErrorAction SilentlyContinue
+if ($null -ne $mvnCmd) {
+    & mvn clean package -DskipTests
     exit $LASTEXITCODE
 }
 
-if (Test-Path "web") {
-    Copy-Item -Recurse -Force "web" "bin/"
-}
-if (Test-Path "config") {
-    Copy-Item -Recurse -Force "config" "bin/"
+$localMvn = "$env:USERPROFILE\apache-maven\apache-maven-3.9.6\bin\mvn.cmd"
+if (Test-Path $localMvn) {
+    & $localMvn clean package -DskipTests
+    exit $LASTEXITCODE
 }
 
-Write-Host "[BUILD SUCCESSFUL] AetherDB compiled cleanly into bin/" -ForegroundColor Green
+Write-Error "Maven executable (mvn) not found! Please install Apache Maven 3.9+ or add it to PATH."
+exit 1

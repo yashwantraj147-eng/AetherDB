@@ -9,9 +9,10 @@ import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Lock-free in-memory buffer for AetherDB LSM-Tree.
+ * Concurrent in-memory buffer for AetherDB LSM-Tree.
  * Uses ConcurrentSkipListMap keyed by raw byte array with custom lexicographical comparator.
- * Tracks approximate memory footprint and sequence number bounds.
+ * Enforces sequence-number monotonicity: an older sequence number will never overwrite
+ * a newer sequence number for the same key.
  */
 public class MemTable implements Iterable<DataRecord> {
 
@@ -33,17 +34,30 @@ public class MemTable implements Iterable<DataRecord> {
 
     /**
      * Inserts or updates a record in the MemTable.
+     * Guarantees that a write with an older sequence number never overwrites a newer record.
      */
     public void put(DataRecord record) {
-        DataRecord previous = map.put(record.getKey(), record);
+        if (record == null) return;
+        byte[] key = record.getKey();
 
-        long delta = record.estimatedSize();
-        if (previous != null) {
-            delta -= previous.estimatedSize();
-        }
-        byteSize.addAndGet(delta);
+        map.compute(key, (k, existing) -> {
+            if (existing == null) {
+                byteSize.addAndGet(record.estimatedSize());
+                updateSequenceBounds(record.getSequenceNumber());
+                return record;
+            }
+            if (record.getSequenceNumber() >= existing.getSequenceNumber()) {
+                long delta = record.estimatedSize() - existing.estimatedSize();
+                byteSize.addAndGet(delta);
+                updateSequenceBounds(record.getSequenceNumber());
+                return record;
+            }
+            // Retain the newer version
+            return existing;
+        });
+    }
 
-        long seq = record.getSequenceNumber();
+    private synchronized void updateSequenceBounds(long seq) {
         if (seq < minSequenceNumber) minSequenceNumber = seq;
         if (seq > maxSequenceNumber) maxSequenceNumber = seq;
     }
@@ -53,10 +67,12 @@ public class MemTable implements Iterable<DataRecord> {
      * Returns null if key is not present.
      */
     public DataRecord get(byte[] key) {
+        if (key == null) return null;
         return map.get(key);
     }
 
     public boolean containsKey(byte[] key) {
+        if (key == null) return false;
         return map.containsKey(key);
     }
 
@@ -92,5 +108,7 @@ public class MemTable implements Iterable<DataRecord> {
     public void clear() {
         map.clear();
         byteSize.set(0);
+        minSequenceNumber = Long.MAX_VALUE;
+        maxSequenceNumber = Long.MIN_VALUE;
     }
 }

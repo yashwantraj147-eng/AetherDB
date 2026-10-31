@@ -1,15 +1,15 @@
 <div align="center">
 
-# ⚡ AetherDB
-### High-Performance Hybrid Key-Value & Columnar Storage Engine Prototype
-*Engineered in pure modern **Java (21–26)** with Virtual Threads, Zero External Dependencies, and Vectorized Aggregation.*
+# ⚡ AetherDB V2
+### Dependable Hybrid LSM Key-Value & Columnar Analytics Storage Engine
+*Engineered in modern **Java 21+** with Virtual Threads, Durable Multi-Segment WAL, Crash Recovery, and Vectorized Aggregations.*
 
 <br/>
 
 [![Java CI](https://github.com/yashwantraj147-eng/AetherDB/actions/workflows/ci.yml/badge.svg)](https://github.com/yashwantraj147-eng/AetherDB/actions/workflows/ci.yml)
-[![Java 21+](https://img.shields.io/badge/Java-21%2B%20%2F%2026-ED8B00?style=for-the-badge&logo=openjdk&logoColor=white)](https://openjdk.org/)
+[![Java 21+](https://img.shields.io/badge/Java-21%2B-ED8B00?style=for-the-badge&logo=openjdk&logoColor=white)](https://openjdk.org/)
+[![Maven 3.9+](https://img.shields.io/badge/Build-Maven%203.9-C71A36?style=for-the-badge&logo=apachemaven&logoColor=white)](https://maven.apache.org/)
 [![Architecture](https://img.shields.io/badge/Architecture-LSM%20%2B%20Columnar-38BDF8?style=for-the-badge)](docs/architecture.md)
-[![Consensus](https://img.shields.io/badge/Consensus-Raft%20(Prototype)-10B981?style=for-the-badge)](docs/architecture.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](LICENSE)
 
 <br/>
@@ -17,9 +17,9 @@
 <a href="#benchmarks">📊 Performance Benchmarks</a> &bull;
 <a href="#architecture">🏛️ Architecture</a> &bull;
 <a href="#quickstart">🚀 Quickstart</a> &bull;
-<a href="#web-studio">✨ Web Studio UI</a> &bull;
 <a href="#api-reference">📡 API Reference</a> &bull;
-<a href="docs/architecture.md">📖 Deep Internals Docs</a>
+<a href="docs/architecture.md">📖 Deep Internals Docs</a> &bull;
+<a href="CHANGELOG.md">📝 Changelog</a>
 
 </div>
 
@@ -27,178 +27,130 @@
 
 ## 🌟 Overview
 
-**AetherDB** is an educational, high-performance prototype storage engine exploring the convergence between operational key-value stores and analytical column engines:
+**AetherDB V2** is a dependable, well-engineered database systems prototype featuring correct storage semantics, crash recovery, version-aware reads, and real analytical execution:
 
-1. **Transactional LSM Tier**: Sequential append-only Write-Ahead Logging (WAL) with CRC32 frame checksums, memory skip-list tables (`ConcurrentSkipListMap`), sparse-indexed SSTables, and Kirsch-Mitzenmacher Bloom filtering.
-2. **Analytical Columnar Tier**: Adaptive Run-Length (RLE) and Dictionary encoding with block Min-Max zone-map statistics for vectorized predicate pushdown.
-3. **Consensus & Clustering (Prototype)**: In-memory Raft state machine simulation featuring term election timers and consistent hashing with 64 virtual nodes.
-
-Built in pure Java with **zero third-party runtime dependencies**, utilizing Java virtual threads (`Thread.ofVirtual()`) and custom binary serialization.
+1. **Transactional LSM Tier**: Sequential append-only Write-Ahead Logging (WAL) with monotonic segment IDs, bounded torn-tail crash recovery, CRC32 frame checksums, version-enforcing skip-lists, sparse-indexed SSTables, and streaming k-way merge compaction.
+2. **Analytical Columnar Tier**: Adaptive Run-Length (RLE) and Dictionary encoding with block Min-Max Zone Maps, independent aggregate state accumulators, and GROUP BY execution.
+3. **HTTP REST Gateway & Security**: Java Virtual Threads (`Thread.ofVirtual()`), Jackson Databind JSON parsing, strict HTTP method enforcement (405), request body bounds, and configurable Bearer token authentication.
+4. **Consensus & Partitioning**: Collision-safe virtual node consistent hash router and experimental Raft simulation prototype ([Design Spec](docs/raft-design.md)).
 
 ---
 
 ## 🏛️ System Architecture
 
-Detailed technical documentation and crash recovery protocols can be reviewed in [docs/architecture.md](docs/architecture.md).
-
-```
-                                  Client Applications / REST API / Studio UI
-                                                      │
-                                                      ▼
-                               ┌───────────────────────────────────────────────┐
-                               │     Virtual-Thread HTTP Gateway & Router      │
-                               └───────────────────────┬───────────────────────┘
-                                                       │
-                       ┌───────────────────────────────┴───────────────────────────────┐
-                       ▼                                                               ▼
-         [Key-Value Mutations & Point Reads]                                [Vectorized Analytical Scans]
-  ┌──────────────────────────────────────────┐                    ┌─────────────────────────────────────────┐
-  │            LSM-Tree Engine               │                    │        Columnar Analytics Engine        │
-  │  • Append-Only Write-Ahead Log (WAL)     │                    │  • Adaptive Dictionary & RLE Encoders   │
-  │  • CRC32 Framed Integrity Verification   │                    │  • Block-Level Min-Max Zone Maps        │
-  │  • ConcurrentSkipListMap MemTable        │                    │  • Vectorized Batch Scanner             │
-  │  • Multi-Level SSTables (.sst / .idx)    │                    │  • Loop-Unrolled Predicate Pushdown     │
-  │  • Kirsch-Mitzenmacher Bloom Filters     │                    │  • Data Skipping Predicate Evaluation   │
-  │  • Multi-Way Merge-Sort Compaction       │                    └────────────────────┬────────────────────┘
-  └────────────────────┬─────────────────────┘                                         │
-                       │                                                               │
-                       └───────────────────────────────┬───────────────────────────────┘
-                                                       │
-                                                       ▼
-                                      ┌──────────────────────────────────┐
-                                      │ Raft Consensus (Experimental)   │
-                                      │ • Leader Election (Heartbeats)   │
-                                      │ • Replicated AppendEntries Log   │
-                                      │ • Consistent Hashing (64 vnodes) │
-                                      └──────────────────────────────────┘
-```
+Detailed engineering specifications are available in the [docs/](docs/) directory:
+- [Storage Engine Internals](docs/storage-engine.md)
+- [WAL & Crash Recovery Mechanics](docs/wal-recovery.md)
+- [SSTable Compaction & Lifecycle](docs/compaction.md)
+- [Columnar Storage & Ingestion](docs/columnar-storage.md)
+- [Query Engine & Predicate Pushdown](docs/query-engine.md)
+- [REST API & Security Controls](docs/rest-api.md)
+- [Raft Status & Prototype Scope](docs/raft-status.md)
+- [Production Raft Design Specification](docs/raft-design.md)
+- [Configuration Reference](docs/configuration.md)
+- [Testing Architecture](docs/testing.md)
 
 ---
 
-## 📊 Benchmark Methodology & Results
+## 📊 Grounded Benchmarks
 
-Microbenchmarks captured using `com.aetherdb.cli.AetherBenchmark` on an x86_64 host (OpenJDK 26, G1GC, 10,000 operation warm-up phase):
+Measured on a standard x86_64 host (Windows 11, OpenJDK 26 compiling Java 21 release, G1GC, 1,000 op warm-up, `System.nanoTime()` sampling via `com.aetherdb.cli.AetherBenchmark`):
 
-| Workload | Concurrency | Total Operations | Latency / Time | Measured Throughput | Operational Notes |
+### Key-Value Operations (20,000 Operations across 4 Virtual Threads)
+| Workload | Throughput | Latency p50 | Latency p95 | Latency p99 | Failure Rate |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Concurrent Writes (`PUT`)** | 4 Virtual Threads | 80,000 Ops | 1,657 ms | **~48,200 IOPS** | Append to WAL + MemTable insertion |
-| **In-Memory Point Lookups (`GET`)** | 4 Virtual Threads | 80,000 Ops | 112 ms | **~714,000 IOPS** | Warm lookups resolved from active MemTable |
-| **Vectorized Column Scan** | Batch size: 1024 | 1,000,000 Rows | 1.84 ms | **High-throughput** | Zone-Map block skipping evaluated |
+| **Concurrent PUT** (WAL + MemTable) | **29,510 IOPS** | 0.022 ms | 0.600 ms | 1.764 ms | 0.00% (0 / 20,000) |
+| **Concurrent GET** (Active MemTable) | **323,139 IOPS** | 0.007 ms | 0.021 ms | 0.053 ms | 0.00% (Hit Ratio: 100%) |
+| **Concurrent DELETE** (WAL Tombstone) | **62,104 IOPS** | 0.014 ms | 0.275 ms | 0.646 ms | 0.00% (0 / 20,000) |
 
----
-
-## ✨ Features
-
-- **Sequential LSM Storage Tier**:
-  - CRC32-framed append-only Write-Ahead Log (WAL) with configurable durability (`IMMEDIATE`, `PERIODIC`, `OS_BUFFER`).
-  - Lock-free memory tables (`ConcurrentSkipListMap`) with asynchronous background disk flusher.
-  - Multi-level SSTables with binary sparse indexing and Kirsch-Mitzenmacher double-hashing Bloom Filters ($O(1)$ negative check filtering).
-  - Multi-way merge sort compaction engine with automated tombstone pruning.
-- **Vectorized Columnar Storage Tier**:
-  - Adaptive on-disk column compression: **Dictionary Encoding** for low-cardinality categorical data and **Run-Length Encoding (RLE)** for consecutive repeating sequences.
-  - **Zone Map Indexing**: Block-level Min-Max statistics enabling queries like `WHERE latency > 50` to skip uncompressed blocks without disk I/O.
-  - Vectorized evaluators for `SUM`, `AVG`, `MIN`, `MAX`, `COUNT`, and multi-predicate selection bitmasks.
-- **Distributed Consensus & Partitioning (Experimental Prototype)**:
-  - Full **Raft Consensus Protocol** implementation with randomized election timers, heartbeat broadcasting, term verification, and replicated log state.
-  - **Consistent Hash Ring** allocating 64 Virtual Nodes (`vnodes`) per physical node using MurmurHash3-32 for uniform key distribution.
-- **Zero-Dependency Architecture**:
-  - Pure modern Java (21–26 compatible).
-  - Embedded HTTP 1.1 server leveraging Java Virtual Threads for non-blocking I/O.
+### Columnar Analytics (100,000 Rows x 20 Iterations)
+- **Query**: `SELECT COUNT(*), SUM(amount), AVG(amount) WHERE amount >= 50.0`
+- **Execution Time**: **8.05 ms** average latency per query.
+- **Scan & Aggregate Throughput**: **12,414,919 rows/sec**.
 
 ---
 
 ## 🚀 Quickstart
 
 ### Prerequisites
-- **Java SE 21+** or **Java SE 26** installed (`java -version`).
-- **Maven 3.8+** (optional, standard build script provided).
+- **Java SE 21+** installed (`java -version`).
+- **Apache Maven 3.8+** installed (`mvn -version`).
 
 ### 1. Build AetherDB
-- **Maven:**
-  ```bash
-  mvn clean compile
-  ```
-- **Windows (PowerShell / CMD without Maven):**
-  ```cmd
-  build.bat
-  ```
-- **Linux / macOS:**
-  ```bash
-  chmod +x build.sh && ./build.sh
-  ```
+```bash
+# Canonical Maven Build
+mvn clean package -DskipTests
 
-### 2. Run All Tests
-Verify all 6 test suites (Bloom Filters, RLE/Dictionary Encoders, ZoneMap Skipping, Hash Ring, LSM Engine, Columnar Scanners):
-```cmd
-test.bat
-# or via Maven:
-mvn test
+# Or using OS build scripts:
+build.bat    # Windows
+./build.sh   # Linux / macOS
 ```
 
-### 3. Launch the Server
-```powershell
-.\run.ps1
-```
-*(Or run `run.bat` on Windows / `./run.sh` on Linux)*
-
----
-
-## 🖥️ AetherDB Studio (Web Cockpit)
-
-Once the engine starts, navigate to:
-```
-http://127.0.0.1:8080/dashboard
+### 2. Run Verification & Regression Test Suite
+Runs all 25 unit and integration tests across WAL recovery, torn tail, CRC checks, SSTable integrity, versioned GET, atomic PUT/DELETE concurrency, streaming compaction, independent aggregates, boundary queries, schema validation, and REST security:
+```bash
+mvn clean test
 ```
 
-The embedded Studio features:
-1. **Telemetry & Live Sparkline**: Real-time IOPS graph updated on a live 2000ms ticker, MemTable memory bytes, and Bloom filter miss savings.
-2. **LSM Key-Value Explorer**: Interactive CRUD operations (`PUT`, `GET`, `DELETE`) with formatted JSON terminal views.
-3. **Vectorized Analytics Studio**: One-click synthetic IoT telemetry generator, preset analytical queries (`COUNT(*)`, `AVG(latency)`, `MAX(latency)`), and execution timing badges.
-4. **Raft & Shards Inspector**: Interactive Consistent Hash Ring visualizer displaying MurmurHash3 assignments and Virtual Node partitions in real time.
+### 3. Launch AetherDB Server
+```bash
+# Windows
+run.bat
+# Linux / macOS
+./run.sh
+```
 
 ---
 
 ## 📡 REST API Reference
 
-### Key-Value Endpoints
-- **Insert / Update Key**:
-  ```bash
-  curl -X POST http://127.0.0.1:8080/api/v1/kv/put \
-    -H "Content-Type: application/json" \
-    -d "{\"key\":\"user:101\",\"value\":\"active-token\"}"
-  ```
-- **Read Key**:
-  ```bash
-  curl "http://127.0.0.1:8080/api/v1/kv/get?key=user:101"
-  ```
-- **Delete Key (Tombstone)**:
-  ```bash
-  curl -X POST "http://127.0.0.1:8080/api/v1/kv/delete?key=user:101"
-  ```
+### Key-Value Store
 
-### Columnar Analytics Endpoints
-- **Ingest Tabular Batch**:
-  ```bash
-  curl -X POST http://127.0.0.1:8080/api/v1/analytics/ingest \
-    -H "Content-Type: application/json" \
-    -d "{\"table\":\"telemetry\"}"
-  ```
-- **Run Vectorized Query**:
-  ```bash
-  curl -X POST http://127.0.0.1:8080/api/v1/analytics/query \
-    -H "Content-Type: application/json" \
-    -d "{\"table\":\"telemetry\",\"select\":\"COUNT(*)\"}"
-  ```
+#### Insert / Update Key (`POST` only)
+```bash
+curl -X POST http://127.0.0.1:8080/api/v1/kv/put \
+  -H "Content-Type: application/json" \
+  -d '{"key":"user:101","value":"active-session"}'
+```
 
-### Telemetry & Cluster Status
-- **Engine Vitals**:
-  ```bash
-  curl http://127.0.0.1:8080/api/v1/metrics
-  ```
-- **Raft State & Leader Info**:
-  ```bash
-  curl http://127.0.0.1:8080/api/v1/cluster/status
-  ```
+#### Read Key (`GET` only)
+```bash
+curl "http://127.0.0.1:8080/api/v1/kv/get?key=user:101"
+```
+
+#### Delete Key (`DELETE` or `POST`)
+```bash
+curl -X DELETE "http://127.0.0.1:8080/api/v1/kv/delete?key=user:101"
+```
+
+---
+
+### Columnar Analytics
+
+#### Batch Ingest Records (`POST` only)
+```bash
+curl -X POST http://127.0.0.1:8080/api/v1/analytics/ingest \
+  -H "Content-Type: application/json" \
+  -d '{
+    "table": "events",
+    "records": [
+      {"id": 1, "region": "us-east", "latency": 14.5, "status": 200},
+      {"id": 2, "region": "us-west", "latency": 22.1, "status": 200}
+    ]
+  }'
+```
+
+#### Run Analytical Query with Aggregates & Grouping (`POST` only)
+```bash
+curl -X POST http://127.0.0.1:8080/api/v1/analytics/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "table": "events",
+    "select": ["COUNT(*)", "AVG(latency)"],
+    "groupBy": ["region"],
+    "limit": 50
+  }'
+```
 
 ---
 

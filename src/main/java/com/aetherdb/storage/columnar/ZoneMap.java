@@ -9,6 +9,7 @@ import java.nio.ByteBuffer;
 /**
  * Min-Max Zone Map for a column chunk block.
  * Enables aggressive predicate pushdown and block skipping without reading or decompressing data.
+ * Correctly distinguishes strict (<, >) from inclusive (<=, >=) comparisons.
  */
 public class ZoneMap {
 
@@ -54,24 +55,38 @@ public class ZoneMap {
     public int getNullCount() { return nullCount; }
     public int getRowCount() { return rowCount; }
 
-    /**
-     * Checks if a target value is guaranteed to NOT be in this chunk based on min/max bounds.
-     */
     public boolean canSkipEquals(ColumnValue target) {
         if (minVal == null || maxVal == null) return false;
         return target.compareTo(minVal) < 0 || target.compareTo(maxVal) > 0;
     }
 
+    public boolean canSkipNotEquals(ColumnValue target) {
+        if (minVal == null || maxVal == null) return false;
+        return nullCount == 0 && minVal.compareTo(target) == 0 && maxVal.compareTo(target) == 0;
+    }
+
     public boolean canSkipGreaterThan(ColumnValue target) {
         if (maxVal == null) return false;
-        // If the maximum value in this chunk is <= target, no value can be > target
+        // If maxVal <= target, no row can be strictly greater than target
         return maxVal.compareTo(target) <= 0;
+    }
+
+    public boolean canSkipGreaterThanOrEquals(ColumnValue target) {
+        if (maxVal == null) return false;
+        // If maxVal < target, no row can be >= target (boundary included)
+        return maxVal.compareTo(target) < 0;
     }
 
     public boolean canSkipLessThan(ColumnValue target) {
         if (minVal == null) return false;
-        // If the minimum value in this chunk is >= target, no value can be < target
+        // If minVal >= target, no row can be strictly less than target
         return minVal.compareTo(target) >= 0;
+    }
+
+    public boolean canSkipLessThanOrEquals(ColumnValue target) {
+        if (minVal == null) return false;
+        // If minVal > target, no row can be <= target (boundary included)
+        return minVal.compareTo(target) > 0;
     }
 
     /**
@@ -107,7 +122,8 @@ public class ZoneMap {
      * Deserializes ZoneMap from ByteBuffer.
      */
     public static ZoneMap deserialize(ByteBuffer buffer) {
-        ColumnType type = ColumnType.fromTypeId(buffer.get());
+        byte typeId = buffer.get();
+        ColumnType type = ColumnType.fromTypeId(typeId);
         int nullCount = buffer.getInt();
         int rowCount = buffer.getInt();
 

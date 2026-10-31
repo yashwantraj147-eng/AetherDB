@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
-if [ ! -f "bin/com/aetherdb/AetherServer.class" ]; then
-    echo "AetherDB is not built yet. Running build.sh..."
-    ./build.sh
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+JAR_FILE="$SCRIPT_DIR/target/aetherdb-2.0.0-SNAPSHOT.jar"
+
+if [ ! -f "$JAR_FILE" ]; then
+    echo "[INFO] Packaging AetherDB executable jar..."
+    "$SCRIPT_DIR/build.sh"
 fi
 
 echo "Starting AetherDB Server..."
-java -cp bin com.aetherdb.AetherServer config/aether-cluster.properties
+exec java -jar "$JAR_FILE" "$SCRIPT_DIR/config/aether-cluster.properties"

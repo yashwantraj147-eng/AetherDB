@@ -4,6 +4,7 @@ import com.aetherdb.common.BinaryUtils;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 /**
@@ -18,12 +19,12 @@ public class IndexBlock {
         private final int length;
 
         public IndexEntry(byte[] lastKey, long offset, int length) {
-            this.lastKey = lastKey;
+            this.lastKey = (lastKey != null) ? lastKey.clone() : new byte[0];
             this.offset = offset;
             this.length = length;
         }
 
-        public byte[] getLastKey() { return lastKey; }
+        public byte[] getLastKey() { return lastKey.clone(); }
         public long getOffset() { return offset; }
         public int getLength() { return length; }
     }
@@ -35,7 +36,7 @@ public class IndexBlock {
     }
 
     public IndexBlock(List<IndexEntry> entries) {
-        this.entries = entries;
+        this.entries = new ArrayList<>(entries);
     }
 
     public void addEntry(byte[] lastKey, long offset, int length) {
@@ -43,7 +44,7 @@ public class IndexBlock {
     }
 
     public List<IndexEntry> getEntries() {
-        return entries;
+        return Collections.unmodifiableList(entries);
     }
 
     public int size() {
@@ -55,6 +56,8 @@ public class IndexBlock {
      * Returns index of the candidate entry, or -1 if the key is greater than all blocks.
      */
     public int findBlockIndex(byte[] key) {
+        if (key == null || entries.isEmpty()) return -1;
+
         int low = 0;
         int high = entries.size() - 1;
         int result = -1;
@@ -83,9 +86,9 @@ public class IndexBlock {
      * Serializes the index block to ByteBuffer.
      */
     public ByteBuffer serialize() {
-        int estimatedSize = 4;
+        int estimatedSize = 8;
         for (IndexEntry e : entries) {
-            estimatedSize += 4 + e.lastKey.length + 8 + 4;
+            estimatedSize += 8 + e.lastKey.length + 8 + 4;
         }
         ByteBuffer buf = ByteBuffer.allocate(estimatedSize);
         BinaryUtils.writeVarInt(buf, entries.size());
@@ -100,17 +103,33 @@ public class IndexBlock {
     }
 
     /**
-     * Deserializes index block from ByteBuffer.
+     * Deserializes index block from ByteBuffer with bounds validation.
      */
-    public static IndexBlock deserialize(ByteBuffer buf) {
+    public static IndexBlock deserialize(ByteBuffer buf) throws CorruptedSSTableException {
+        if (buf.remaining() < 1) {
+            throw new CorruptedSSTableException("IndexBlock buffer empty");
+        }
         int count = BinaryUtils.readVarInt(buf);
-        List<IndexEntry> list = new ArrayList<>(count);
+        if (count < 0 || count > 10_000_000) {
+            throw new CorruptedSSTableException("Invalid IndexBlock entry count: " + count);
+        }
+
+        List<IndexEntry> list = new ArrayList<>(Math.min(count, 1024));
         for (int i = 0; i < count; i++) {
             int keyLen = BinaryUtils.readVarInt(buf);
+            if (keyLen < 0 || keyLen > 65536 || buf.remaining() < keyLen) {
+                throw new CorruptedSSTableException("Corrupt key length in index entry at index " + i + ": " + keyLen);
+            }
             byte[] key = new byte[keyLen];
             buf.get(key);
+            if (buf.remaining() < 12) {
+                throw new CorruptedSSTableException("Missing offset or length in index entry at index " + i);
+            }
             long offset = buf.getLong();
             int length = buf.getInt();
+            if (offset < 0 || length <= 0) {
+                throw new CorruptedSSTableException("Invalid offset/length in index entry at index " + i);
+            }
             list.add(new IndexEntry(key, offset, length));
         }
         return new IndexBlock(list);

@@ -2,7 +2,7 @@ name: AetherDB CI
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, 'refactor/**' ]
   pull_request:
     branches: [ main, master ]
 
@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        java-version: [ '21', '22' ]
+        java-version: [ '21' ]
 
     steps:
       - name: Checkout repository
@@ -25,11 +25,5 @@ jobs:
           distribution: 'temurin'
           cache: 'maven'
 
-      - name: Build with Maven
+      - name: Build & Verify with Maven
         run: mvn --batch-mode --update-snapshots verify
-
-      - name: Run Standalone TestRunner Suite
-        run: |
-          mkdir -p bin
-          javac -d bin $(find src/main/java src/test/java -name "*.java" ! -name "AetherDbJUnitTest.java")
-          java -cp bin com.aetherdb.test.TestRunner

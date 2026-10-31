@@ -1,11 +1,12 @@
 @echo off
 setlocal
 
-if not exist "bin\com\aetherdb\AetherServer.class" (
-    echo AetherDB is not built yet. Running build.bat...
+set JAR_FILE=%~dp0target\aetherdb-2.0.0-SNAPSHOT.jar
+if not exist "%JAR_FILE%" (
+    echo [INFO] Packaging AetherDB executable jar...
     call "%~dp0build.bat"
     if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
 )
 
 echo Starting AetherDB Server...
-java -cp "%~dp0bin" com.aetherdb.AetherServer "%~dp0config\aether-cluster.properties"
+java -jar "%JAR_FILE%" "%~dp0config\aether-cluster.properties"
