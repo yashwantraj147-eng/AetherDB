@@ -19,6 +19,7 @@ import org.junit.jupiter.api.Test;
 import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
@@ -337,5 +338,157 @@ public class ColumnarStorageTest {
                     Map.of("id", ColumnValue.ofLong(3), "score", ColumnValue.ofString("invalid_string_score"))
             ));
         });
+    }
+
+    @Test
+    @DisplayName("Schema registration validation: rejects invalid names, mismatches, and incompatible replacements")
+    void testSchemaRegistrationValidation() throws Exception {
+        Schema validSchema = new Schema("users", List.of(
+                new ColumnDefinition("user_id", ColumnType.INT64),
+                new ColumnDefinition("name", ColumnType.STRING)
+        ));
+
+        // 1. Mismatched table name between argument and schema
+        assertThrows(IllegalArgumentException.class, () -> {
+            storage.registerTableSchema("different_table_name", validSchema);
+        });
+
+        // 2. Invalid table name (path traversal)
+        assertThrows(IllegalArgumentException.class, () -> {
+            storage.registerTableSchema("../traversal", new Schema("../traversal", List.of(new ColumnDefinition("c", ColumnType.INT32))));
+        });
+
+        // 3. Empty schema definition
+        assertThrows(IllegalArgumentException.class, () -> {
+            storage.registerTableSchema("empty_schema", new Schema("empty_schema", Collections.emptyList()));
+        });
+
+        // 4. Valid registration succeeds
+        storage.registerTableSchema("users", validSchema);
+        assertEquals(validSchema, storage.getTableSchema("users"));
+
+        // 5. Idempotent re-registration of identical schema succeeds
+        assertDoesNotThrow(() -> {
+            storage.registerTableSchema("users", validSchema);
+        });
+
+        // 6. Incompatible schema replacement throws IllegalArgumentException
+        Schema incompatibleSchema = new Schema("users", List.of(
+                new ColumnDefinition("user_id", ColumnType.STRING), // Changed type!
+                new ColumnDefinition("name", ColumnType.STRING)
+        ));
+        assertThrows(IllegalArgumentException.class, () -> {
+            storage.registerTableSchema("users", incompatibleSchema);
+        });
+    }
+
+    @Test
+    @DisplayName("Schema registration: incompatible schema registration rejected if chunks already exist")
+    void testSchemaRegistrationIncompatibleWithExistingChunksRejected() throws Exception {
+        storage.ingestColumnar("metrics_tbl", List.of(
+                Map.of("id", ColumnValue.ofLong(1), "metric_val", ColumnValue.ofDouble(12.34))
+        ));
+
+        Schema incompatible = new Schema("metrics_tbl", List.of(
+                new ColumnDefinition("id", ColumnType.INT64),
+                new ColumnDefinition("metric_val", ColumnType.INT32) // Incompatible type with existing chunk
+        ));
+
+        assertThrows(IllegalArgumentException.class, () -> {
+            storage.registerTableSchema("metrics_tbl", incompatible);
+        });
+    }
+
+    @Test
+    @DisplayName("ZoneMap Immutability: ZoneMaps in ColumnarChunk are frozen and cannot be mutated")
+    void testZoneMapImmutabilityInChunk() throws Exception {
+        storage.ingestColumnar("telemetry", List.of(
+                Map.of("device_id", ColumnValue.ofLong(10), "temperature", ColumnValue.ofDouble(25.0)),
+                Map.of("device_id", ColumnValue.ofLong(20), "temperature", ColumnValue.ofDouble(35.0))
+        ));
+
+        List<ColumnarChunk> chunks = storage.getColumnarChunks("telemetry");
+        assertEquals(1, chunks.size());
+        ColumnarChunk chunk = chunks.get(0);
+
+        ZoneMap tempZm = chunk.getZoneMap("temperature");
+        assertNotNull(tempZm);
+        assertTrue(tempZm.isFrozen(), "ZoneMap in published chunk must be frozen");
+        assertEquals(25.0, tempZm.getMinVal().asDouble(), 0.001);
+        assertEquals(35.0, tempZm.getMaxVal().asDouble(), 0.001);
+
+        // Attempting to update a frozen ZoneMap must throw UnsupportedOperationException
+        assertThrows(UnsupportedOperationException.class, () -> {
+            tempZm.update(ColumnValue.ofDouble(999.0));
+        });
+
+        // Statistics remain unchanged
+        assertEquals(25.0, tempZm.getMinVal().asDouble(), 0.001);
+        assertEquals(35.0, tempZm.getMaxVal().asDouble(), 0.001);
+        assertEquals(2, tempZm.getRowCount());
+        assertEquals(0, tempZm.getNullCount());
+
+        // Predicate pushdown decisions remain completely accurate
+        assertTrue(tempZm.canSkipGreaterThan(ColumnValue.ofDouble(40.0)));
+        assertFalse(tempZm.canSkipGreaterThan(ColumnValue.ofDouble(30.0)));
+        assertTrue(tempZm.canSkipLessThan(ColumnValue.ofDouble(20.0)));
+        assertFalse(tempZm.canSkipLessThan(ColumnValue.ofDouble(26.0)));
+    }
+
+    @Test
+    @DisplayName("ZoneMap Deserialization: validates counts and min/max consistency")
+    void testZoneMapDeserializationValidation() {
+        // 1. Negative null count
+        ByteBuffer badNullCount = ByteBuffer.allocate(64);
+        badNullCount.put(ColumnType.INT32.getTypeId());
+        badNullCount.putInt(-1); // invalid negative nullCount
+        badNullCount.putInt(10); // rowCount
+        badNullCount.put((byte) 0);
+        badNullCount.put((byte) 0);
+        badNullCount.flip();
+
+        assertThrows(IllegalArgumentException.class, () -> ZoneMap.deserialize(badNullCount));
+
+        // 2. nullCount > rowCount
+        ByteBuffer badRatio = ByteBuffer.allocate(64);
+        badRatio.put(ColumnType.INT32.getTypeId());
+        badRatio.putInt(15); // nullCount > rowCount
+        badRatio.putInt(10); // rowCount
+        badRatio.put((byte) 0);
+        badRatio.put((byte) 0);
+        badRatio.flip();
+
+        assertThrows(IllegalArgumentException.class, () -> ZoneMap.deserialize(badRatio));
+
+        // 3. minVal > maxVal
+        ByteBuffer badMinMax = ByteBuffer.allocate(64);
+        badMinMax.put(ColumnType.INT64.getTypeId());
+        badMinMax.putInt(0);
+        badMinMax.putInt(10);
+        badMinMax.put((byte) 1); // minVal present
+        badMinMax.putLong(100L); // min = 100
+        badMinMax.put((byte) 1); // maxVal present
+        badMinMax.putLong(50L);  // max = 50 (min > max!)
+        badMinMax.flip();
+
+        assertThrows(IllegalArgumentException.class, () -> ZoneMap.deserialize(badMinMax));
+
+        // 4. Valid deserialization produces frozen ZoneMap
+        ByteBuffer validBuf = ByteBuffer.allocate(64);
+        validBuf.put(ColumnType.INT64.getTypeId());
+        validBuf.putInt(1);
+        validBuf.putInt(10);
+        validBuf.put((byte) 1);
+        validBuf.putLong(50L);
+        validBuf.put((byte) 1);
+        validBuf.putLong(100L);
+        validBuf.flip();
+
+        ZoneMap zm = ZoneMap.deserialize(validBuf);
+        assertNotNull(zm);
+        assertTrue(zm.isFrozen());
+        assertEquals(50L, zm.getMinVal().asLong());
+        assertEquals(100L, zm.getMaxVal().asLong());
+        assertThrows(UnsupportedOperationException.class, () -> zm.update(ColumnValue.ofLong(200L)));
     }
 }

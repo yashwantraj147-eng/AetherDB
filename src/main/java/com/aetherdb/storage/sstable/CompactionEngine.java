@@ -76,7 +76,7 @@ public class CompactionEngine {
         }
     }
 
-    private static class StreamingMergeIterator implements CloseableIterator<DataRecord> {
+    public static class StreamingMergeIterator implements CloseableIterator<DataRecord> {
         private final PriorityQueue<MergeElement> minHeap = new PriorityQueue<>();
         private final List<CloseableIterator<DataRecord>> sourceIterators = new ArrayList<>();
         private final boolean isDeepestLevel;
@@ -86,14 +86,29 @@ public class CompactionEngine {
 
         public StreamingMergeIterator(List<SSTableReader> inputTables, boolean isDeepestLevel) {
             this.isDeepestLevel = isDeepestLevel;
-            for (int i = 0; i < inputTables.size(); i++) {
-                CloseableIterator<DataRecord> it = inputTables.get(i).iterator();
-                sourceIterators.add(it);
-                if (it.hasNext()) {
-                    minHeap.add(new MergeElement(it.next(), i, it));
+            try {
+                for (int i = 0; i < inputTables.size(); i++) {
+                    CloseableIterator<DataRecord> it = inputTables.get(i).iterator();
+                    sourceIterators.add(it);
+                    if (it.hasNext()) {
+                        minHeap.add(new MergeElement(it.next(), i, it));
+                    }
                 }
+                advance();
+            } catch (Throwable t) {
+                // If any error occurs during iterator acquisition or initialization,
+                // close all previously acquired iterators to prevent reference leaks.
+                for (CloseableIterator<DataRecord> it : sourceIterators) {
+                    try {
+                        it.close();
+                    } catch (Throwable suppressed) {
+                        t.addSuppressed(suppressed);
+                    }
+                }
+                sourceIterators.clear();
+                minHeap.clear();
+                throw t;
             }
-            advance();
         }
 
         private void advance() {
@@ -149,6 +164,7 @@ public class CompactionEngine {
                     it.close();
                 } catch (Throwable ignored) {}
             }
+            sourceIterators.clear();
         }
     }
 }

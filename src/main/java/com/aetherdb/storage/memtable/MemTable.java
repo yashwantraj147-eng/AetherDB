@@ -17,7 +17,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * Uses ConcurrentSkipListMap keyed by raw byte array with custom lexicographical comparator.
  * Enforces sequence-number monotonicity: an older sequence number will never overwrite
  * a newer sequence number for the same key.
- * Tracks explicit lifecycle states to prevent duplicate flush executions.
+ * Tracks explicit lifecycle states and synchronized attempt futures to prevent duplicate flush executions.
  */
 public class MemTable implements Iterable<DataRecord> {
 
@@ -79,6 +79,23 @@ public class MemTable implements Iterable<DataRecord> {
     }
 
     /**
+     * Atomically claims ownership of a flush attempt for this MemTable.
+     * If the table is in SEALED, QUEUED, or FAILED state, it transitions to FLUSHING,
+     * assigns a brand-new CompletableFuture representing this attempt, and returns the future.
+     * If another thread already claimed the attempt and it is actively running, returns null
+     * so callers can await the active getFlushFuture().
+     */
+    public synchronized CompletableFuture<SSTableReader> claimFlushAttempt() {
+        State current = state.get();
+        if (current == State.SEALED || current == State.QUEUED || current == State.FAILED) {
+            state.set(State.FLUSHING);
+            this.flushFuture = new CompletableFuture<>();
+            return this.flushFuture;
+        }
+        return null;
+    }
+
+    /**
      * Inserts or updates a record in the MemTable.
      * Guarantees that a write with an older sequence number never overwrites a newer record.
      */
@@ -108,53 +125,44 @@ public class MemTable implements Iterable<DataRecord> {
         if (seq > maxSequenceNumber) maxSequenceNumber = seq;
     }
 
-    /**
-     * Retrieves the latest version of a record for the given key.
-     * Returns null if key is not present.
-     */
     public DataRecord get(byte[] key) {
-        if (key == null) return null;
         return map.get(key);
     }
 
     public boolean containsKey(byte[] key) {
-        if (key == null) return false;
         return map.containsKey(key);
     }
 
-    public long getByteSize() {
-        return Math.max(0, byteSize.get());
+    public int getRecordCount() {
+        return map.size();
     }
 
     public int size() {
         return map.size();
     }
 
+    public long getByteSize() {
+        return byteSize.get();
+    }
+
     public boolean isEmpty() {
         return map.isEmpty();
     }
 
+    public Collection<DataRecord> values() {
+        return map.values();
+    }
+
     public long getMinSequenceNumber() {
-        return minSequenceNumber == Long.MAX_VALUE ? 0 : minSequenceNumber;
+        return minSequenceNumber;
     }
 
     public long getMaxSequenceNumber() {
-        return maxSequenceNumber == Long.MIN_VALUE ? 0 : maxSequenceNumber;
-    }
-
-    public Collection<DataRecord> records() {
-        return map.values();
+        return maxSequenceNumber;
     }
 
     @Override
     public Iterator<DataRecord> iterator() {
         return map.values().iterator();
-    }
-
-    public void clear() {
-        map.clear();
-        byteSize.set(0);
-        minSequenceNumber = Long.MAX_VALUE;
-        maxSequenceNumber = Long.MIN_VALUE;
     }
 }

@@ -19,6 +19,7 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -252,5 +253,125 @@ public class LifecycleAndRecoveryTest {
         } finally {
             newStorage.close();
         }
+    }
+
+    @Test
+    @DisplayName("Priority 0: Manual flush racing with close aborts publication safely and preserves WAL")
+    void testManualFlushRacesWithClose() throws Exception {
+        for (int i = 0; i < 50; i++) {
+            storage.put("flush_race_" + i, "val_" + i);
+        }
+
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        CountDownLatch flushStarted = new CountDownLatch(1);
+        AtomicReference<Exception> flushEx = new AtomicReference<>();
+
+        executor.submit(() -> {
+            try {
+                flushStarted.countDown();
+                storage.flushMemTable();
+            } catch (Exception e) {
+                flushEx.set(e);
+            }
+        });
+
+        flushStarted.await();
+        // Concurrently close the storage engine
+        storage.close();
+        assertEquals(LifecycleState.CLOSED, storage.getLifecycleState());
+
+        executor.shutdown();
+        assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+
+        // Reopen engine: all acknowledged writes must be recovered from WAL
+        HybridStorageManager restarted = new HybridStorageManager(config);
+        try {
+            assertEquals(LifecycleState.OPEN, restarted.getLifecycleState());
+            for (int i = 0; i < 50; i++) {
+                DataRecord rec = restarted.get("flush_race_" + i);
+                assertNotNull(rec, "Missing key flush_race_" + i + " after recovery");
+                assertEquals("val_" + i, rec.getValueAsString());
+            }
+        } finally {
+            restarted.close();
+        }
+    }
+
+    @Test
+    @DisplayName("Priority 0: Manual compaction racing with close terminates cleanly without corrupting SSTables")
+    void testCompactionRacesWithClose() throws Exception {
+        // Create multiple SSTables
+        for (int batch = 0; batch < 4; batch++) {
+            for (int i = 0; i < 10; i++) {
+                storage.put("compact_k_" + batch + "_" + i, "v_" + i);
+            }
+            storage.flushMemTable();
+        }
+
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        CountDownLatch compactStarted = new CountDownLatch(1);
+
+        executor.submit(() -> {
+            try {
+                compactStarted.countDown();
+                storage.compact();
+            } catch (Exception ignored) {}
+        });
+
+        compactStarted.await();
+        storage.close();
+        assertEquals(LifecycleState.CLOSED, storage.getLifecycleState());
+
+        executor.shutdown();
+        assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+
+        // Restart engine and verify all records survive
+        HybridStorageManager restarted = new HybridStorageManager(config);
+        try {
+            assertEquals(LifecycleState.OPEN, restarted.getLifecycleState());
+            for (int batch = 0; batch < 4; batch++) {
+                for (int i = 0; i < 10; i++) {
+                    DataRecord rec = restarted.get("compact_k_" + batch + "_" + i);
+                    assertNotNull(rec, "Record lost after compaction race: compact_k_" + batch + "_" + i);
+                }
+            }
+        } finally {
+            restarted.close();
+        }
+    }
+
+    @Test
+    @DisplayName("Priority 0: MemTable flush attempt claim assigns fresh future and coordinates callers")
+    void testMemTableClaimFlushAttemptFreshFuture() {
+        MemTable memTable = new MemTable(12345L);
+        memTable.setState(MemTable.State.SEALED);
+
+        // 1. First caller claims attempt
+        CompletableFuture<SSTableReader> f1 = memTable.claimFlushAttempt();
+        assertNotNull(f1);
+        assertEquals(MemTable.State.FLUSHING, memTable.getState());
+
+        // 2. Second concurrent caller attempts to claim attempt -> returns null (already in flight)
+        CompletableFuture<SSTableReader> f2 = memTable.claimFlushAttempt();
+        assertNull(f2, "Concurrent claim on actively flushing MemTable must return null");
+        assertSame(f1, memTable.getFlushFuture(), "Callers must share the same active future");
+
+        // 3. Complete the future exceptionally (simulating flush failure)
+        f1.completeExceptionally(new IOException("Simulated disk error"));
+        memTable.setState(MemTable.State.FAILED);
+
+        // 4. Retry claim on FAILED MemTable must create a BRAND NEW uncompleted future!
+        CompletableFuture<SSTableReader> f3 = memTable.claimFlushAttempt();
+        assertNotNull(f3);
+        assertNotSame(f1, f3, "Retry must allocate a fresh future rather than reusing exceptional future");
+        assertFalse(f3.isDone(), "Fresh future must not be completed yet");
+    }
+
+    @Test
+    @DisplayName("Priority 0: retryFailedFlushes probes WAL directory writeability and recovers cleanly")
+    void testRetryFailedFlushesProbe() throws Exception {
+        storage.put("probe_k1", "probe_v1");
+        assertDoesNotThrow(() -> storage.retryFailedFlushes());
+        assertEquals("probe_v1", storage.get("probe_k1").getValueAsString());
     }
 }

@@ -10,6 +10,7 @@ import java.nio.ByteBuffer;
  * Min-Max Zone Map for a column chunk block.
  * Enables aggressive predicate pushdown and block skipping without reading or decompressing data.
  * Correctly distinguishes strict (<, >) from inclusive (<=, >=) comparisons.
+ * Supports immutability / freezing to prevent post-publication state corruption.
  */
 public class ZoneMap {
 
@@ -18,6 +19,7 @@ public class ZoneMap {
     private ColumnValue maxVal;
     private int nullCount;
     private int rowCount;
+    private volatile boolean frozen = false;
 
     public ZoneMap(ColumnType type) {
         this.type = type;
@@ -35,7 +37,25 @@ public class ZoneMap {
         this.rowCount = rowCount;
     }
 
+    public void freeze() {
+        this.frozen = true;
+    }
+
+    public boolean isFrozen() {
+        return frozen;
+    }
+
+    public ZoneMap toImmutable() {
+        if (this.frozen) return this;
+        ZoneMap copy = new ZoneMap(type, minVal, maxVal, nullCount, rowCount);
+        copy.freeze();
+        return copy;
+    }
+
     public void update(ColumnValue val) {
+        if (frozen) {
+            throw new UnsupportedOperationException("Cannot update an immutable (frozen) ZoneMap");
+        }
         rowCount++;
         if (val == null || val.isNull()) {
             nullCount++;
@@ -54,6 +74,7 @@ public class ZoneMap {
     public ColumnValue getMaxVal() { return maxVal; }
     public int getNullCount() { return nullCount; }
     public int getRowCount() { return rowCount; }
+    public ColumnType getType() { return type; }
 
     public boolean canSkipEquals(ColumnValue target) {
         if (minVal == null || maxVal == null) return false;
@@ -119,13 +140,17 @@ public class ZoneMap {
     }
 
     /**
-     * Deserializes ZoneMap from ByteBuffer.
+     * Deserializes ZoneMap from ByteBuffer with count and consistency validation.
      */
     public static ZoneMap deserialize(ByteBuffer buffer) {
         byte typeId = buffer.get();
         ColumnType type = ColumnType.fromTypeId(typeId);
         int nullCount = buffer.getInt();
         int rowCount = buffer.getInt();
+
+        if (nullCount < 0 || rowCount < 0 || nullCount > rowCount) {
+            throw new IllegalArgumentException("Invalid ZoneMap counts: nullCount=" + nullCount + ", rowCount=" + rowCount);
+        }
 
         ColumnValue minVal = null;
         if (buffer.get() == 1) {
@@ -137,7 +162,13 @@ public class ZoneMap {
             maxVal = deserializeValue(buffer, type);
         }
 
-        return new ZoneMap(type, minVal, maxVal, nullCount, rowCount);
+        if (minVal != null && maxVal != null && minVal.compareTo(maxVal) > 0) {
+            throw new IllegalArgumentException("Invalid ZoneMap min/max consistency: minVal " + minVal + " > maxVal " + maxVal);
+        }
+
+        ZoneMap zm = new ZoneMap(type, minVal, maxVal, nullCount, rowCount);
+        zm.freeze();
+        return zm;
     }
 
     private static ColumnValue deserializeValue(ByteBuffer buffer, ColumnType type) {

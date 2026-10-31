@@ -14,15 +14,11 @@ import org.junit.jupiter.api.Test;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Comparator;
 import java.util.List;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -156,5 +152,78 @@ public class CompactionStreamingTest {
         assertNull(engine.get("resurrect_key"), "Deleted record must not resurrect after compaction");
 
         engine.close();
+    }
+
+    @Test
+    @DisplayName("Compaction iterator: constructor failure on later source iterator closes earlier iterators without leak")
+    void testStreamingMergeIteratorConstructorFailureClosesPriorIterators() throws Exception {
+        // Create 2 valid SSTables
+        File f1 = new File(tempDir.toFile(), "sstable_merge_01.sst");
+        SSTableWriter w1 = new SSTableWriter(f1, 10, 0, 4096, 0.01);
+        w1.write(List.of(DataRecord.put("alpha", "val_alpha", 100)).iterator(), 1);
+        SSTableReader r1 = new SSTableReader(f1);
+
+        File f2 = new File(tempDir.toFile(), "sstable_merge_02.sst");
+        SSTableWriter w2 = new SSTableWriter(f2, 20, 0, 4096, 0.01);
+        w2.write(List.of(DataRecord.put("beta", "val_beta", 200)).iterator(), 1);
+        SSTableReader r2 = new SSTableReader(f2);
+
+        // Base references are 1 each
+        assertEquals(1, r1.getRefCount());
+        assertEquals(1, r2.getRefCount());
+
+        // Close r2 so its iterator() call throws IllegalStateException
+        r2.close();
+        assertTrue(r2.isClosed());
+
+        // Construct StreamingMergeIterator with [r1, r2]. Opening r2 iterator will fail!
+        IllegalStateException thrown = assertThrows(IllegalStateException.class, () -> {
+            new CompactionEngine.StreamingMergeIterator(List.of(r1, r2), false);
+        });
+        assertTrue(thrown.getMessage().contains("Cannot iterate over closed SSTable"));
+
+        // Crucial verification: r1's acquired iterator reference MUST be released back to 1
+        assertEquals(1, r1.getRefCount(), "Active references for r1 must not leak following constructor failure");
+
+        // r1 remains open, valid, and readable
+        DataRecord rec = r1.get("alpha".getBytes(Constants.DEFAULT_CHARSET));
+        assertNotNull(rec);
+        assertEquals("val_alpha", rec.getValueAsString());
+
+        r1.close();
+        assertEquals(0, r1.getRefCount());
+    }
+
+    @Test
+    @DisplayName("Compaction iterator: corrupted data block during initialization releases all iterators")
+    void testStreamingMergeIteratorBlockFailureReleasesIterators() throws Exception {
+        File f1 = new File(tempDir.toFile(), "sstable_block_01.sst");
+        SSTableWriter w1 = new SSTableWriter(f1, 30, 0, 4096, 0.01);
+        w1.write(List.of(DataRecord.put("key1", "val1", 10)).iterator(), 1);
+        SSTableReader r1 = new SSTableReader(f1);
+
+        File f2 = new File(tempDir.toFile(), "sstable_block_02.sst");
+        SSTableWriter w2 = new SSTableWriter(f2, 40, 0, 4096, 0.01);
+        w2.write(List.of(DataRecord.put("key2", "val2", 20)).iterator(), 1);
+        SSTableReader r2 = new SSTableReader(f2);
+
+        // Corrupt the data block inside f2 on disk (offset 6 is where the first block starts)
+        try (RandomAccessFile raf = new RandomAccessFile(f2, "rw")) {
+            raf.seek(6);
+            raf.writeInt(0xDEADBEEF);
+            raf.writeInt(0xCAFEBABE);
+        }
+
+        // Constructing StreamingMergeIterator reads the first record from each reader.
+        // r2 will fail on block CRC verification or deserialization!
+        assertThrows(Exception.class, () -> {
+            new CompactionEngine.StreamingMergeIterator(List.of(r1, r2), false);
+        });
+
+        // Verify r1's reference count was safely restored to 1 without leaking
+        assertEquals(1, r1.getRefCount());
+
+        r1.close();
+        r2.close();
     }
 }

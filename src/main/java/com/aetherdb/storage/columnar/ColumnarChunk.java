@@ -43,7 +43,15 @@ public class ColumnarChunk {
         this.chunkId = chunkId;
         this.schema = schema;
         this.rowCount = rowCount;
-        this.zoneMaps = Collections.unmodifiableMap(new HashMap<>(zoneMaps));
+        Map<String, ZoneMap> frozenZoneMaps = new HashMap<>();
+        if (zoneMaps != null) {
+            for (Map.Entry<String, ZoneMap> entry : zoneMaps.entrySet()) {
+                if (entry.getValue() != null) {
+                    frozenZoneMaps.put(entry.getKey(), entry.getValue().toImmutable());
+                }
+            }
+        }
+        this.zoneMaps = Collections.unmodifiableMap(frozenZoneMaps);
         Map<String, byte[]> copy = new HashMap<>();
         if (encodedColumns != null) {
             for (Map.Entry<String, byte[]> entry : encodedColumns.entrySet()) {

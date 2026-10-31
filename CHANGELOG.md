@@ -4,6 +4,40 @@ All notable changes and architectural repairs in **AetherDB V2** are documented 
 
 ---
 
+## [2.0.3] - 2026-10-31
+
+### Manual Flush vs Shutdown Race Protection (Priority 0)
+- **Active Storage Operation Tracking**: Introduced atomic `activeOperations` counter guarding all public mutating and read/scan operations (`put()`, `delete()`, `get()`, `flushMemTable()`, `compact()`, `registerTableSchema()`).
+- **Shutdown Operation Drain Barrier**: Engine shutdown transitions lifecycle state to `CLOSING` to reject new operation admissions, and blocks up to a bounded timeout for all in-flight manual operations and flush tasks to safely complete before closing background executors.
+- **Publication-Time Lifecycle Verification**: Both manual and background flush paths verify `lifecycleState == LifecycleState.OPEN` under write lock immediately before installing new SSTable readers. If the engine is `CLOSING` or `CLOSED`, the newly written SSTable is closed and discarded, the MemTable is marked `FAILED`, its future completes exceptionally, and its associated WAL segment is preserved (not retired) for recovery upon restart.
+- **Compaction Publication Guard**: Caller-triggered and background compactions verify engine state under write lock before installing replacements; if shutdown intervened, compacted tables are cleanly closed and discarded while input SSTables remain intact.
+- **Safe Retryable Shutdown**: If in-flight tasks exceed the bounded shutdown timeout, resources (WAL and SSTable readers) remain open in `CLOSING` state and `close()` throws an `IOException`, permitting safe retry without resource leaks or thread hangs.
+
+### Flush Future and Retry Coordination (Priority 0)
+- **Atomic Flush Attempt Claiming**: Implemented `claimFlushAttempt()` on `MemTable` to safely transition `SEALED`, `QUEUED`, or `FAILED` states to `FLUSHING` with a fresh `CompletableFuture<File>` per attempt.
+- **Stale Future Reuse Prevention**: Subsequent flush attempts after transient failures never reuse already completed exceptional futures. Concurrent callers safely coordinate and await the active attempt's future.
+- **Directory Writeability Verification in Flush Retries**: `retryFailedFlushes()` verifies storage directory writeability with a temporary probe file before clearing `FAILED` state and re-attempting pending flushes.
+
+### Compaction Iterator Constructor Cleanup Safety (Priority 1)
+- **Exception-Safe Iterator Initialization**: Wrapped source iterator acquisition and initial entry advancement in `CompactionEngine.StreamingMergeIterator` constructor in a try-catch block.
+- **Guaranteed Reader Cleanup on Construction Failure**: If any iterator acquisition or block read fails during iterator construction, all previously opened iterators are safely closed, and any cleanup errors are attached as suppressed exceptions to the primary cause.
+
+### Table Schema Registration & Columnar Ingestion Rules (Priority 1)
+- **Strict Table Name Validation**: Enforced pattern validation (`^[a-zA-Z0-9_]{1,128}$`) on table names and verified exact equality between registration argument and `schema.getTableName()`.
+- **Idempotent Re-registration**: Allowed re-registering identical schemas idempotently without error.
+- **Schema Mutation Protection**: Replaced schema validation ensures incompatible column additions or modified data types are rejected with `IllegalArgumentException`.
+- **Loaded Chunk Consistency Check**: Registering a schema for existing tables verifies compatibility across all pre-existing columnar chunks on disk.
+
+### ZoneMap Immutability & Deserialization Hardening (Priority 1)
+- **ZoneMap Immutability Flag**: Introduced `freeze()`, `isFrozen()`, and `toImmutable()` on `ZoneMap`. Attempting to modify frozen ZoneMaps via `update()` throws `UnsupportedOperationException`.
+- **Chunk Boundary Encapsulation**: `ColumnarChunk` constructor automatically freezes all input ZoneMaps upon chunk construction.
+- **Deserialization Sanity Checks**: `ZoneMap.deserialize()` validates record counts (`rowCount >= 0`, `nullCount >= 0`, `rowCount >= nullCount`) and min/max consistency (`min <= max`), rejecting corrupted or malicious stream data with `CorruptedSchemaException`.
+
+### Build & Test Suite Expansion (Priority 2)
+- **78 Automated Unit & Regression Tests**: Test suite expanded from 68 to 78 automated JUnit 5 tests covering manual flush vs close races, compaction vs close races, iterator construction cleanup, schema registration constraints, and ZoneMap immutability with 100% pass rate.
+
+---
+
 ## [2.0.2] - 2026-10-31
 
 ### Storage Engine Lifecycle & Shutdown Safety (Priority 0)

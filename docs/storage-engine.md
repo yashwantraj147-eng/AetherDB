@@ -20,11 +20,16 @@ All mutating operations (`put`, `delete`, `flushMemTable`, `compact`) re-validat
 
 ### Graceful Bounded Shutdown:
 During `close()`:
-1. State atomically transitions to `CLOSING`.
-2. Active background flushes and compactions are awaited up to a bounded timeout (`executorTerminationTimeoutMs`, default 5 seconds).
-3. If tasks do not terminate within the timeout, resources (WAL and active SSTables) are safely left open in `CLOSING` state rather than closed beneath active worker threads, allowing safe retry.
-4. If workers finish cleanly, all WAL files and SSTable readers are closed, and state transitions to `CLOSED`.
-5. Background tasks cancelled during shutdown verify state and discard/close their uninstalled readers rather than publishing them to the live table collection.
+1. State atomically transitions to `CLOSING` to reject new operation admissions.
+2. In-flight manual operations (tracked via `activeOperations`) are drained up to a bounded timeout (`executorTerminationTimeoutMs`, default 5 seconds).
+3. Active background flushes and compactions are awaited up to the bounded timeout.
+4. If tasks do not terminate within the timeout, resources (WAL and active SSTables) are safely left open in `CLOSING` state rather than closed beneath active worker threads, allowing safe retry.
+5. If workers and active operations finish cleanly, all WAL files and SSTable readers are closed, and state transitions to `CLOSED`.
+6. Background tasks and manual flushes verify state under write lock immediately before installing new SSTable readers. If the engine is `CLOSING` or `CLOSED`, the newly written SSTable is closed and discarded, the MemTable is marked `FAILED`, its future completes exceptionally, and its associated WAL segment is preserved (not retired) for recovery upon restart.
+
+
+
+
 
 ---
 
@@ -72,3 +77,4 @@ Reads (`get(byte[] key)`) execute version-aware candidate selection under `rwLoc
 - Automatically releases the reference count when the iterator is fully consumed.
 - Releases the reference count immediately upon explicit `close()` or if an exception occurs during block loading.
 - `CompactionEngine` processes all source iterators in try-with-resources blocks, ensuring references are never leaked during successful or failed compaction passes.
+- `StreamingMergeIterator` wraps its initialization in exception-safe try-catch blocks to guarantee all previously opened source iterators are closed if any failure occurs during construction.

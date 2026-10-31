@@ -1,7 +1,7 @@
 @echo off
 setlocal
 
-set JAR_FILE=%~dp0target\aetherdb-2.0.2.jar
+set JAR_FILE=%~dp0target\aetherdb-2.0.3.jar
 if exist "%JAR_FILE%" goto :start_server
 
 echo [INFO] Packaging AetherDB executable jar...

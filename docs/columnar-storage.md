@@ -25,7 +25,7 @@ AetherDB columnar chunks (`.achunk`) store typed tabular data with dictionary an
 
 1. **Table Name Sanitization**: Table names are validated against regex `^[a-zA-Z0-9_]{1,64}$`. Directory traversal attempts (e.g. `../`, `/`, `\`) throw `IllegalArgumentException`.
 2. **Untyped All-Null Policy**: If an initial ingestion batch contains a column where every value is untyped null, AetherDB strictly rejects the batch with an `IllegalArgumentException` requiring explicit schema registration, rather than silently defaulting to `STRING`.
-3. **Explicit Schema Registration**: Tables can be pre-registered via `registerTableSchema(schema)`. When a schema is pre-registered, initial all-null batches are accepted and correctly typed according to the registered schema.
+3. **Explicit Schema Registration**: Tables can be pre-registered via `registerTableSchema(schema)`. Table names must match `^[a-zA-Z0-9_]{1,128}$` and strictly match `schema.getTableName()`. Re-registering an identical schema is idempotent; incompatible schema replacements are rejected with `IllegalArgumentException`. Registering a schema for an existing table verifies compatibility across all pre-existing chunks on disk. When a schema is pre-registered, initial all-null batches are accepted and correctly typed according to the registered schema.
 4. **Schema Ingestion Consistency**: Ingested records are checked against the initial schema definition. Rows with missing columns receive typed null values; rows with unexpected extra columns or incompatible types throw clear schema mismatch exceptions.
 5. **Chunk Row Limits**: `columnar.chunk.max.rows` (default 65,536) automatically partitions large batch ingestions into appropriately sized chunk files.
 
@@ -35,6 +35,7 @@ AetherDB columnar chunks (`.achunk`) store typed tabular data with dictionary an
 
 1. **Schema Allocation Bounds**: `Schema.deserialize()` enforces strict bounds (`MAX_COLUMNS = 10,000`, table and column name length <= 255 bytes). Rejects duplicate column names and unsupported column types with `CorruptedSchemaException`.
 2. **Defensive Immutability**: `ColumnarChunk` performs defensive copying of byte arrays upon construction and accessor calls (`getEncodedColumn()`, `getEncodedColumns()`). Decoded column lists returned by `getDecodedColumn()` are wrapped in unmodifiable lists, preventing external mutation of cached state.
+3. **ZoneMap Immutability & Bounds**: `ZoneMap` instances are frozen upon incorporation into `ColumnarChunk`, rejecting subsequent mutations with `UnsupportedOperationException`. Deserialization rigorously verifies record counts (`rowCount >= 0`, `nullCount >= 0`, `rowCount >= nullCount`) and min/max consistency (`min <= max`), rejecting corrupted streams with `CorruptedSchemaException`.
 
 ---
 

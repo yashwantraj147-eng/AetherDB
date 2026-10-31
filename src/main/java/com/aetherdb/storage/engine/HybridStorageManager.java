@@ -27,19 +27,12 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.regex.Pattern;
 
 /**
- * Hybrid Transactional & Analytical Storage Engine implementation for AetherDB.
- * Coordinates writes through Write-Ahead Log (WAL), in-memory MemTables,
- * immutable SSTables (Level-0 through Compaction), and Columnar Chunks.
+ * Hybrid Storage Engine coordinating:
+ * 1. LSM-Tree Key-Value Engine (WAL -> Active MemTable -> Flushing MemTables -> SSTables -> Compaction)
+ * 2. Columnar Analytics Engine (Chunk files with ZoneMap predicate pushdown)
  *
- * Durability and Concurrency Guarantees:
- * - WAL rotation and multi-segment replay across restarts.
- * - Sequence numbers persist monotonically across restarts and compactions.
- * - Atomic write ordering: sequence allocation, WAL append, and MemTable insertion are atomic.
- * - Version-aware point lookups: selects newest record across all storage layers; tombstones hide older values.
- * - Compaction isolation: safe publication transaction prevents reader stalls or missing key errors.
- * - Tombstone resurrection prevention: tombstones retained across compaction unless all older sources are purged.
- * - Flush ownership: MemTable lifecycle states guarantee idempotent, non-duplicate flush execution.
- * - Engine lifecycle safety: explicit LifecycleState (OPEN, CLOSING, CLOSED, FAILED) with strict synchronization.
+ * Implements strict lifecycle states (OPEN, CLOSING, CLOSED, FAILED), double-checked synchronization,
+ * operation admission tracking, pre-rotated WAL swapping, safe bounded shutdown, and defensive serialization.
  */
 public class HybridStorageManager implements StorageEngine {
 
@@ -56,6 +49,7 @@ public class HybridStorageManager implements StorageEngine {
     private final AtomicLong chunkIdGenerator = new AtomicLong(1);
     private final AtomicLong walSegmentIdGenerator = new AtomicLong(1);
     private final AtomicInteger activeFlushTasks = new AtomicInteger(0);
+    private final AtomicInteger activeOperations = new AtomicInteger(0);
 
     private final ReentrantReadWriteLock rwLock = new ReentrantReadWriteLock();
     private final ThreadPoolExecutor backgroundExecutor;
@@ -214,6 +208,26 @@ public class HybridStorageManager implements StorageEngine {
         chunkIdGenerator.set(maxChunkId + 1);
     }
 
+    private void enterOperation() {
+        LifecycleState current = lifecycleState.get();
+        if (current != LifecycleState.OPEN) {
+            throw new IllegalStateException("Storage engine is " + current + (failureReason != null ? ": " + failureReason : ""));
+        }
+        activeOperations.incrementAndGet();
+        if (lifecycleState.get() != LifecycleState.OPEN) {
+            activeOperations.decrementAndGet();
+            throw new IllegalStateException("Storage engine is " + lifecycleState.get() + (failureReason != null ? ": " + failureReason : ""));
+        }
+    }
+
+    private void exitOperation() {
+        activeOperations.decrementAndGet();
+    }
+
+    public int getActiveOperationCount() {
+        return activeOperations.get();
+    }
+
     @Override
     public LifecycleState getLifecycleState() {
         return lifecycleState.get();
@@ -225,28 +239,33 @@ public class HybridStorageManager implements StorageEngine {
             throw new IllegalArgumentException("Key cannot be null");
         }
 
-        rwLock.writeLock().lock();
+        enterOperation();
         try {
-            LifecycleState state = lifecycleState.get();
-            if (state == LifecycleState.CLOSING || state == LifecycleState.CLOSED) {
-                throw new IllegalStateException("Storage engine is closing or closed");
-            }
-            if (state == LifecycleState.FAILED) {
-                throw new IllegalStateException("Storage engine is in FAILED state: " + failureReason);
-            }
+            rwLock.writeLock().lock();
+            try {
+                LifecycleState state = lifecycleState.get();
+                if (state == LifecycleState.CLOSING || state == LifecycleState.CLOSED) {
+                    throw new IllegalStateException("Storage engine is closing or closed");
+                }
+                if (state == LifecycleState.FAILED) {
+                    throw new IllegalStateException("Storage engine is in FAILED state: " + failureReason);
+                }
 
-            long seq = sequenceNumberGenerator.getAndIncrement();
-            DataRecord record = DataRecord.put(key, value, seq);
+                long seq = sequenceNumberGenerator.getAndIncrement();
+                DataRecord record = DataRecord.put(key, value, seq);
 
-            wal.append(record);
-            activeMemTable.put(record);
-            totalPuts.incrementAndGet();
+                wal.append(record);
+                activeMemTable.put(record);
+                totalPuts.incrementAndGet();
 
-            if (activeMemTable.getByteSize() >= config.getMemTableMaxBytes()) {
-                triggerMemTableFlush();
+                if (activeMemTable.getByteSize() >= config.getMemTableMaxBytes()) {
+                    triggerMemTableFlush();
+                }
+            } finally {
+                rwLock.writeLock().unlock();
             }
         } finally {
-            rwLock.writeLock().unlock();
+            exitOperation();
         }
     }
 
@@ -260,59 +279,64 @@ public class HybridStorageManager implements StorageEngine {
     public DataRecord get(byte[] key) throws IOException {
         if (key == null) return null;
 
-        rwLock.readLock().lock();
+        enterOperation();
         try {
-            LifecycleState state = lifecycleState.get();
-            if (state == LifecycleState.CLOSED) {
-                throw new IllegalStateException("Storage engine is closed");
-            }
-            if (state == LifecycleState.FAILED) {
-                throw new IllegalStateException("Storage engine is in FAILED state: " + failureReason);
-            }
+            rwLock.readLock().lock();
+            try {
+                LifecycleState state = lifecycleState.get();
+                if (state == LifecycleState.CLOSED) {
+                    throw new IllegalStateException("Storage engine is closed");
+                }
+                if (state == LifecycleState.FAILED) {
+                    throw new IllegalStateException("Storage engine is in FAILED state: " + failureReason);
+                }
 
-            totalGets.incrementAndGet();
-            DataRecord newestCandidate = null;
+                totalGets.incrementAndGet();
+                DataRecord newestCandidate = null;
 
-            // 1. Search active MemTable
-            DataRecord memRecord = activeMemTable.get(key);
-            if (memRecord != null) {
-                newestCandidate = memRecord;
-            }
+                // 1. Search active MemTable
+                DataRecord memRecord = activeMemTable.get(key);
+                if (memRecord != null) {
+                    newestCandidate = memRecord;
+                }
 
-            // 2. Search immutable MemTables currently in flight
-            for (MemTable imm : immutableMemTables) {
-                DataRecord immRecord = imm.get(key);
-                if (immRecord != null) {
-                    if (newestCandidate == null || immRecord.getSequenceNumber() > newestCandidate.getSequenceNumber()) {
-                        newestCandidate = immRecord;
+                // 2. Search immutable MemTables currently in flight
+                for (MemTable imm : immutableMemTables) {
+                    DataRecord immRecord = imm.get(key);
+                    if (immRecord != null) {
+                        if (newestCandidate == null || immRecord.getSequenceNumber() > newestCandidate.getSequenceNumber()) {
+                            newestCandidate = immRecord;
+                        }
                     }
                 }
-            }
 
-            // 3. Search SSTables (from newest to oldest)
-            for (SSTableReader sstable : sstables) {
-                if (newestCandidate != null && sstable.getMetadata().getMaxSequenceNumber() <= newestCandidate.getSequenceNumber()) {
-                    continue;
-                }
-                DataRecord sstRecord = sstable.get(key);
-                if (sstRecord != null) {
-                    sstableHits.incrementAndGet();
-                    if (newestCandidate == null || sstRecord.getSequenceNumber() > newestCandidate.getSequenceNumber()) {
-                        newestCandidate = sstRecord;
+                // 3. Search SSTables (from newest to oldest)
+                for (SSTableReader sstable : sstables) {
+                    if (newestCandidate != null && sstable.getMetadata().getMaxSequenceNumber() <= newestCandidate.getSequenceNumber()) {
+                        continue;
                     }
-                } else {
-                    bloomFilterMisses.incrementAndGet();
+                    DataRecord sstRecord = sstable.get(key);
+                    if (sstRecord != null) {
+                        sstableHits.incrementAndGet();
+                        if (newestCandidate == null || sstRecord.getSequenceNumber() > newestCandidate.getSequenceNumber()) {
+                            newestCandidate = sstRecord;
+                        }
+                    } else {
+                        bloomFilterMisses.incrementAndGet();
+                    }
                 }
-            }
 
-            if (newestCandidate != null) {
-                memtableHits.incrementAndGet();
-                return newestCandidate.isTombstone() ? null : newestCandidate;
-            }
+                if (newestCandidate != null) {
+                    memtableHits.incrementAndGet();
+                    return newestCandidate.isTombstone() ? null : newestCandidate;
+                }
 
-            return null;
+                return null;
+            } finally {
+                rwLock.readLock().unlock();
+            }
         } finally {
-            rwLock.readLock().unlock();
+            exitOperation();
         }
     }
 
@@ -327,28 +351,33 @@ public class HybridStorageManager implements StorageEngine {
             throw new IllegalArgumentException("Key cannot be null");
         }
 
-        rwLock.writeLock().lock();
+        enterOperation();
         try {
-            LifecycleState state = lifecycleState.get();
-            if (state == LifecycleState.CLOSING || state == LifecycleState.CLOSED) {
-                throw new IllegalStateException("Storage engine is closing or closed");
-            }
-            if (state == LifecycleState.FAILED) {
-                throw new IllegalStateException("Storage engine is in FAILED state: " + failureReason);
-            }
+            rwLock.writeLock().lock();
+            try {
+                LifecycleState state = lifecycleState.get();
+                if (state == LifecycleState.CLOSING || state == LifecycleState.CLOSED) {
+                    throw new IllegalStateException("Storage engine is closing or closed");
+                }
+                if (state == LifecycleState.FAILED) {
+                    throw new IllegalStateException("Storage engine is in FAILED state: " + failureReason);
+                }
 
-            long seq = sequenceNumberGenerator.getAndIncrement();
-            DataRecord record = DataRecord.delete(key, seq);
+                long seq = sequenceNumberGenerator.getAndIncrement();
+                DataRecord record = DataRecord.delete(key, seq);
 
-            wal.append(record);
-            activeMemTable.put(record);
-            totalDeletes.incrementAndGet();
+                wal.append(record);
+                activeMemTable.put(record);
+                totalDeletes.incrementAndGet();
 
-            if (activeMemTable.getByteSize() >= config.getMemTableMaxBytes()) {
-                triggerMemTableFlush();
+                if (activeMemTable.getByteSize() >= config.getMemTableMaxBytes()) {
+                    triggerMemTableFlush();
+                }
+            } finally {
+                rwLock.writeLock().unlock();
             }
         } finally {
-            rwLock.writeLock().unlock();
+            exitOperation();
         }
     }
 
@@ -383,20 +412,17 @@ public class HybridStorageManager implements StorageEngine {
         sealedMemTable.setAssociatedWalFile(rotatedWal);
         activeMemTable = new MemTable(System.currentTimeMillis());
         immutableMemTables.add(sealedMemTable);
-        sealedMemTable.transitionTo(MemTable.State.SEALED, MemTable.State.QUEUED);
 
-        CompletableFuture<SSTableReader> flushFuture = new CompletableFuture<>();
-        sealedMemTable.setFlushFuture(flushFuture);
+        CompletableFuture<SSTableReader> flushFuture = sealedMemTable.claimFlushAttempt();
+        if (flushFuture == null) {
+            return;
+        }
 
         final File walSegmentToRetire = rotatedWal;
         activeFlushTasks.incrementAndGet();
 
         backgroundExecutor.submit(() -> {
             try {
-                if (!sealedMemTable.transitionTo(MemTable.State.QUEUED, MemTable.State.FLUSHING)) {
-                    // Flush already claimed by a concurrent manual flush
-                    return;
-                }
                 long tableId = sstableIdGenerator.getAndIncrement();
                 MemTableFlushTask flushTask = new MemTableFlushTask(
                         sealedMemTable, sstableDir, tableId, config, walSegmentToRetire);
@@ -405,9 +431,10 @@ public class HybridStorageManager implements StorageEngine {
                 rwLock.writeLock().lock();
                 try {
                     LifecycleState state = lifecycleState.get();
-                    if (state == LifecycleState.CLOSED || state == LifecycleState.FAILED) {
-                        // Engine closed or failed before publication; close reader and preserve WAL!
+                    if (state != LifecycleState.OPEN) {
+                        // Engine closed, closing, or failed before publication; close reader and preserve WAL!
                         newReader.close();
+                        sealedMemTable.setState(MemTable.State.FAILED);
                         flushFuture.completeExceptionally(new IllegalStateException("Engine " + state + "; flush aborted before publication"));
                         return;
                     }
@@ -438,195 +465,228 @@ public class HybridStorageManager implements StorageEngine {
 
     @Override
     public void flushMemTable() throws IOException {
-        LifecycleState currentLifecycle = lifecycleState.get();
-        if (currentLifecycle != LifecycleState.OPEN) {
-            throw new IllegalStateException("Cannot flush; storage engine is " + currentLifecycle);
-        }
-
-        List<CompletableFuture<SSTableReader>> inFlightFutures = new ArrayList<>();
-        List<MemTable> tablesToFlushDirectly = new ArrayList<>();
-
-        rwLock.readLock().lock();
+        enterOperation();
         try {
-            for (MemTable imm : immutableMemTables) {
-                MemTable.State st = imm.getState();
-                if (st == MemTable.State.FLUSHING) {
-                    if (imm.getFlushFuture() != null) {
-                        inFlightFutures.add(imm.getFlushFuture());
+            List<CompletableFuture<SSTableReader>> inFlightFutures = new ArrayList<>();
+            List<MemTable> tablesToFlushDirectly = new ArrayList<>();
+
+            rwLock.readLock().lock();
+            try {
+                for (MemTable imm : immutableMemTables) {
+                    MemTable.State st = imm.getState();
+                    if (st == MemTable.State.FLUSHING) {
+                        if (imm.getFlushFuture() != null) {
+                            inFlightFutures.add(imm.getFlushFuture());
+                        }
+                    } else if (st == MemTable.State.QUEUED || st == MemTable.State.SEALED || st == MemTable.State.FAILED) {
+                        tablesToFlushDirectly.add(imm);
                     }
-                } else if (st == MemTable.State.QUEUED || st == MemTable.State.SEALED || st == MemTable.State.FAILED) {
-                    tablesToFlushDirectly.add(imm);
+                }
+            } finally {
+                rwLock.readLock().unlock();
+            }
+
+            // Directly flush any un-flushed immutable MemTables (QUEUED, SEALED, FAILED)
+            for (MemTable imm : tablesToFlushDirectly) {
+                CompletableFuture<SSTableReader> attemptFuture = imm.claimFlushAttempt();
+                if (attemptFuture != null) {
+                    try {
+                        long tableId = sstableIdGenerator.getAndIncrement();
+                        MemTableFlushTask flushTask = new MemTableFlushTask(
+                                imm, sstableDir, tableId, config, imm.getAssociatedWalFile());
+                        SSTableReader newReader = flushTask.execute();
+
+                        rwLock.writeLock().lock();
+                        try {
+                            LifecycleState state = lifecycleState.get();
+                            if (state != LifecycleState.OPEN) {
+                                newReader.close();
+                                imm.setState(MemTable.State.FAILED);
+                                attemptFuture.completeExceptionally(new IOException("Engine " + state + " during flush publication"));
+                                return;
+                            }
+                            sstables.add(0, newReader);
+                            immutableMemTables.remove(imm);
+                            imm.setState(MemTable.State.INSTALLED);
+                            flushTask.retireAssociatedWal();
+                            attemptFuture.complete(newReader);
+                        } finally {
+                            rwLock.writeLock().unlock();
+                        }
+                    } catch (Exception e) {
+                        imm.setState(MemTable.State.FAILED);
+                        attemptFuture.completeExceptionally(e);
+                        throw new IOException("Manual flush of immutable MemTable failed: " + e.getMessage(), e);
+                    }
+                } else if (imm.getFlushFuture() != null) {
+                    inFlightFutures.add(imm.getFlushFuture());
                 }
             }
-        } finally {
-            rwLock.readLock().unlock();
-        }
 
-        // Directly flush any un-flushed immutable MemTables (QUEUED, SEALED, FAILED)
-        for (MemTable imm : tablesToFlushDirectly) {
-            if (imm.transitionTo(MemTable.State.QUEUED, MemTable.State.FLUSHING) ||
-                imm.transitionTo(MemTable.State.SEALED, MemTable.State.FLUSHING) ||
-                imm.transitionTo(MemTable.State.FAILED, MemTable.State.FLUSHING)) {
+            // Await any in-flight background flushes outside of locks
+            for (CompletableFuture<SSTableReader> f : inFlightFutures) {
+                try {
+                    f.get(30, TimeUnit.SECONDS);
+                } catch (Exception e) {
+                    throw new IOException("Awaiting background flush completion failed: " + e.getMessage(), e);
+                }
+            }
+
+            // Seal and flush active MemTable if non-empty
+            MemTable tableToFlush = null;
+            File rotatedWal = null;
+            CompletableFuture<SSTableReader> activeFuture = null;
+
+            rwLock.writeLock().lock();
+            try {
+                if (lifecycleState.get() != LifecycleState.OPEN) {
+                    throw new IllegalStateException("Storage engine is " + lifecycleState.get());
+                }
+                if (!activeMemTable.isEmpty()) {
+                    long nextSegId = walSegmentIdGenerator.getAndIncrement();
+                    rotatedWal = wal.rotate(nextSegId);
+                    tableToFlush = activeMemTable;
+                    tableToFlush.setState(MemTable.State.SEALED);
+                    tableToFlush.setAssociatedWalFile(rotatedWal);
+                    activeFuture = tableToFlush.claimFlushAttempt();
+                    activeMemTable = new MemTable(System.currentTimeMillis());
+                    immutableMemTables.add(tableToFlush);
+                }
+            } catch (IOException e) {
+                this.failureReason = "WAL rotation failed during manual flush: " + e.getMessage();
+                this.lifecycleState.set(LifecycleState.FAILED);
+                throw e;
+            } finally {
+                rwLock.writeLock().unlock();
+            }
+
+            if (tableToFlush != null && activeFuture != null) {
                 try {
                     long tableId = sstableIdGenerator.getAndIncrement();
                     MemTableFlushTask flushTask = new MemTableFlushTask(
-                            imm, sstableDir, tableId, config, imm.getAssociatedWalFile());
+                            tableToFlush, sstableDir, tableId, config, rotatedWal);
                     SSTableReader newReader = flushTask.execute();
 
                     rwLock.writeLock().lock();
                     try {
-                        sstables.add(0, newReader);
-                        immutableMemTables.remove(imm);
-                        imm.setState(MemTable.State.INSTALLED);
-                        flushTask.retireAssociatedWal();
-                        if (imm.getFlushFuture() != null) {
-                            imm.getFlushFuture().complete(newReader);
+                        LifecycleState state = lifecycleState.get();
+                        if (state != LifecycleState.OPEN) {
+                            newReader.close();
+                            tableToFlush.setState(MemTable.State.FAILED);
+                            activeFuture.completeExceptionally(new IOException("Engine " + state + " during flush publication"));
+                            return;
                         }
+                        sstables.add(0, newReader);
+                        immutableMemTables.remove(tableToFlush);
+                        tableToFlush.setState(MemTable.State.INSTALLED);
+                        flushTask.retireAssociatedWal();
+                        activeFuture.complete(newReader);
                     } finally {
                         rwLock.writeLock().unlock();
                     }
                 } catch (Exception e) {
-                    imm.setState(MemTable.State.FAILED);
-                    throw new IOException("Manual flush of immutable MemTable failed: " + e.getMessage(), e);
+                    tableToFlush.setState(MemTable.State.FAILED);
+                    activeFuture.completeExceptionally(e);
+                    throw new IOException("Manual flush of active MemTable failed: " + e.getMessage(), e);
                 }
-            } else if (imm.getState() == MemTable.State.FLUSHING && imm.getFlushFuture() != null) {
-                inFlightFutures.add(imm.getFlushFuture());
             }
-        }
-
-        // Await any in-flight background flushes outside of locks
-        for (CompletableFuture<SSTableReader> f : inFlightFutures) {
-            try {
-                f.get(30, TimeUnit.SECONDS);
-            } catch (Exception e) {
-                throw new IOException("Awaiting background flush completion failed: " + e.getMessage(), e);
-            }
-        }
-
-        // Seal and flush active MemTable if non-empty
-        MemTable tableToFlush = null;
-        File rotatedWal = null;
-
-        rwLock.writeLock().lock();
-        try {
-            if (lifecycleState.get() != LifecycleState.OPEN) {
-                throw new IllegalStateException("Storage engine is " + lifecycleState.get());
-            }
-            if (!activeMemTable.isEmpty()) {
-                long nextSegId = walSegmentIdGenerator.getAndIncrement();
-                rotatedWal = wal.rotate(nextSegId);
-                tableToFlush = activeMemTable;
-                tableToFlush.transitionTo(MemTable.State.ACTIVE, MemTable.State.FLUSHING);
-                tableToFlush.setAssociatedWalFile(rotatedWal);
-                activeMemTable = new MemTable(System.currentTimeMillis());
-                immutableMemTables.add(tableToFlush);
-            }
-        } catch (IOException e) {
-            this.failureReason = "WAL rotation failed during manual flush: " + e.getMessage();
-            this.lifecycleState.set(LifecycleState.FAILED);
-            throw e;
         } finally {
-            rwLock.writeLock().unlock();
-        }
-
-        if (tableToFlush != null) {
-            try {
-                long tableId = sstableIdGenerator.getAndIncrement();
-                MemTableFlushTask flushTask = new MemTableFlushTask(
-                        tableToFlush, sstableDir, tableId, config, rotatedWal);
-                SSTableReader newReader = flushTask.execute();
-
-                rwLock.writeLock().lock();
-                try {
-                    sstables.add(0, newReader);
-                    immutableMemTables.remove(tableToFlush);
-                    tableToFlush.setState(MemTable.State.INSTALLED);
-                    flushTask.retireAssociatedWal();
-                } finally {
-                    rwLock.writeLock().unlock();
-                }
-            } catch (Exception e) {
-                tableToFlush.setState(MemTable.State.FAILED);
-                throw new IOException("Manual flush of active MemTable failed: " + e.getMessage(), e);
-            }
+            exitOperation();
         }
     }
 
     @Override
     public void retryFailedFlushes() throws IOException {
-        rwLock.writeLock().lock();
+        enterOperation();
         try {
-            if (lifecycleState.get() == LifecycleState.FAILED) {
-                if (wal != null && !wal.isClosed()) {
+            rwLock.writeLock().lock();
+            try {
+                if (lifecycleState.get() == LifecycleState.CLOSING || lifecycleState.get() == LifecycleState.CLOSED) {
+                    throw new IllegalStateException("Storage engine is " + lifecycleState.get());
+                }
+                if (lifecycleState.get() == LifecycleState.FAILED) {
+                    if (wal == null || wal.isClosed()) {
+                        throw new IOException("Cannot recover engine from FAILED state: WAL is null or closed");
+                    }
+                    // Test WAL directory writeability with a test probe file
+                    File probeFile = new File(walDir, ".recovery_probe_" + System.nanoTime() + ".tmp");
+                    try {
+                        if (!probeFile.createNewFile()) {
+                            throw new IOException("Cannot create probe file in WAL directory " + walDir);
+                        }
+                        probeFile.delete();
+                    } catch (IOException probeEx) {
+                        throw new IOException("Cannot recover engine from FAILED state: WAL storage is not writable: " + probeEx.getMessage(), probeEx);
+                    }
+                    // Recovered safely
                     lifecycleState.set(LifecycleState.OPEN);
                     failureReason = null;
                 }
+            } finally {
+                rwLock.writeLock().unlock();
             }
-        } finally {
-            rwLock.writeLock().unlock();
-        }
 
-        flushMemTable();
+            flushMemTable();
+        } finally {
+            exitOperation();
+        }
     }
 
     @Override
     public synchronized void compact() throws IOException {
-        if (lifecycleState.get() != LifecycleState.OPEN) return;
-
-        List<SSTableReader> tablesToCompact;
-        rwLock.readLock().lock();
+        enterOperation();
         try {
-            if (sstables.size() < 2) return;
-            tablesToCompact = new ArrayList<>(sstables);
-        } finally {
-            rwLock.readLock().unlock();
-        }
+            if (lifecycleState.get() != LifecycleState.OPEN) return;
 
-        long newTableId = sstableIdGenerator.getAndIncrement();
-        String targetFilename = String.format("sstable_%06d%s", newTableId, Constants.SSTABLE_DATA_EXT);
-        File targetFile = new File(sstableDir, targetFilename);
-
-        // Tombstone safety check:
-        // Prune tombstones ONLY if:
-        // 1. All existing SSTables participate in compaction.
-        // 2. There are NO immutable MemTables pending flush.
-        // 3. There are NO background flush tasks currently in flight.
-        boolean hasPendingFlushes = !immutableMemTables.isEmpty() || activeFlushTasks.get() > 0;
-        boolean isFullCompaction = (tablesToCompact.size() == sstables.size());
-        boolean canPruneTombstones = isFullCompaction && !hasPendingFlushes;
-
-        SSTableReader compacted = CompactionEngine.compact(
-                tablesToCompact,
-                targetFile,
-                newTableId,
-                1, // Level 1
-                config.getSSTableBlockSize(),
-                config.getBloomFpr(),
-                canPruneTombstones
-        );
-
-        // Atomic publication transaction:
-        // Readers always see either the complete old storage snapshot or the complete new storage snapshot.
-        rwLock.writeLock().lock();
-        try {
-            LifecycleState state = lifecycleState.get();
-            if (state != LifecycleState.OPEN && state != LifecycleState.CLOSING) {
-                // Engine closed while compacting; discard compacted reader safely
-                compacted.close();
-                return;
+            List<SSTableReader> tablesToCompact;
+            rwLock.readLock().lock();
+            try {
+                if (sstables.size() < 2) return;
+                tablesToCompact = new ArrayList<>(sstables);
+            } finally {
+                rwLock.readLock().unlock();
             }
 
-            sstables.removeAll(tablesToCompact);
-            sstables.add(compacted);
-            // Sort SSTables newest first by table ID
-            sstables.sort((a, b) -> Long.compare(b.getTableId(), a.getTableId()));
+            long newTableId = sstableIdGenerator.getAndIncrement();
+            String targetFilename = String.format("sstable_%06d%s", newTableId, Constants.SSTABLE_DATA_EXT);
+            File targetFile = new File(sstableDir, targetFilename);
 
-            // Retire obsolete files ONLY after the replacement is safely installed
-            for (SSTableReader oldReader : tablesToCompact) {
-                oldReader.markObsolete();
+            boolean hasPendingFlushes = !immutableMemTables.isEmpty() || activeFlushTasks.get() > 0;
+            boolean isFullCompaction = (tablesToCompact.size() == sstables.size());
+            boolean canPruneTombstones = isFullCompaction && !hasPendingFlushes;
+
+            SSTableReader compacted = CompactionEngine.compact(
+                    tablesToCompact,
+                    targetFile,
+                    newTableId,
+                    1, // Level 1
+                    config.getSSTableBlockSize(),
+                    config.getBloomFpr(),
+                    canPruneTombstones
+            );
+
+            // Atomic publication transaction:
+            rwLock.writeLock().lock();
+            try {
+                LifecycleState state = lifecycleState.get();
+                if (state != LifecycleState.OPEN) {
+                    // Engine closed or closing while compacting; discard compacted reader safely
+                    compacted.close();
+                    return;
+                }
+
+                sstables.removeAll(tablesToCompact);
+                sstables.add(compacted);
+                sstables.sort((a, b) -> Long.compare(b.getTableId(), a.getTableId()));
+
+                for (SSTableReader oldReader : tablesToCompact) {
+                    oldReader.markObsolete();
+                }
+            } finally {
+                rwLock.writeLock().unlock();
             }
         } finally {
-            rwLock.writeLock().unlock();
+            exitOperation();
         }
     }
 
@@ -635,14 +695,46 @@ public class HybridStorageManager implements StorageEngine {
         if (schema == null) {
             throw new IllegalArgumentException("Schema cannot be null");
         }
-        tableSchemas.put(schema.getTableName(), schema);
+        registerTableSchema(schema.getTableName(), schema);
     }
 
     @Override
     public void registerTableSchema(String tableName, Schema schema) {
-        if (tableName == null || schema == null) {
-            throw new IllegalArgumentException("Table name and schema cannot be null");
+        if (tableName == null || !TABLE_NAME_PATTERN.matcher(tableName).matches()) {
+            throw new IllegalArgumentException("Invalid table name: '" + tableName + "'. Must be alphanumeric and up to 64 chars.");
         }
+        if (schema == null) {
+            throw new IllegalArgumentException("Schema cannot be null");
+        }
+        if (!tableName.equals(schema.getTableName())) {
+            throw new IllegalArgumentException("Table name '" + tableName + "' does not match schema table name '" + schema.getTableName() + "'");
+        }
+        if (schema.getColumnCount() == 0) {
+            throw new IllegalArgumentException("Schema must define at least one column");
+        }
+
+        // Check against existing registered schema
+        Schema existing = tableSchemas.get(tableName);
+        if (existing != null) {
+            if (existing.equals(schema)) {
+                return; // Idempotent re-registration of identical schema
+            }
+            throw new IllegalArgumentException("Cannot replace existing schema for table '" + tableName 
+                    + "': existing=" + existing + ", new=" + schema);
+        }
+
+        // Check compatibility against already loaded columnar chunks
+        List<ColumnarChunk> existingChunks = columnarTables.get(tableName);
+        if (existingChunks != null && !existingChunks.isEmpty()) {
+            for (ColumnarChunk chunk : existingChunks) {
+                Schema chunkSchema = chunk.getSchema();
+                if (!chunkSchema.equals(schema)) {
+                    throw new IllegalArgumentException("New schema incompatible with existing chunk data for table '" 
+                            + tableName + "': chunkSchema=" + chunkSchema + ", newSchema=" + schema);
+                }
+            }
+        }
+
         tableSchemas.put(tableName, schema);
     }
 
@@ -654,27 +746,32 @@ public class HybridStorageManager implements StorageEngine {
 
     @Override
     public void ingestColumnar(String tableName, List<Map<String, ColumnValue>> records) throws IOException {
-        LifecycleState state = lifecycleState.get();
-        if (state == LifecycleState.CLOSING || state == LifecycleState.CLOSED) {
-            throw new IllegalStateException("Storage engine is closing or closed");
-        }
-        if (state == LifecycleState.FAILED) {
-            throw new IllegalStateException("Storage engine is in FAILED state: " + failureReason);
-        }
-        if (tableName == null || !TABLE_NAME_PATTERN.matcher(tableName).matches()) {
-            throw new IllegalArgumentException("Invalid table name: '" + tableName + "'. Must be alphanumeric and up to 64 chars.");
-        }
-        if (records == null || records.isEmpty()) return;
+        enterOperation();
+        try {
+            LifecycleState state = lifecycleState.get();
+            if (state == LifecycleState.CLOSING || state == LifecycleState.CLOSED) {
+                throw new IllegalStateException("Storage engine is closing or closed");
+            }
+            if (state == LifecycleState.FAILED) {
+                throw new IllegalStateException("Storage engine is in FAILED state: " + failureReason);
+            }
+            if (tableName == null || !TABLE_NAME_PATTERN.matcher(tableName).matches()) {
+                throw new IllegalArgumentException("Invalid table name: '" + tableName + "'. Must be alphanumeric and up to 64 chars.");
+            }
+            if (records == null || records.isEmpty()) return;
 
-        // Ensure stable table schema across all batches; rejects all-null columns if untyped
-        Schema schema = getOrInferTableSchema(tableName, records);
+            // Ensure stable table schema across all batches; rejects all-null columns if untyped
+            Schema schema = getOrInferTableSchema(tableName, records);
 
-        // Partition ingestion into batches of at most config.getColumnarMaxRows()
-        int maxRowsPerChunk = Math.max(1, config.getColumnarMaxRows());
-        for (int i = 0; i < records.size(); i += maxRowsPerChunk) {
-            int toIndex = Math.min(i + maxRowsPerChunk, records.size());
-            List<Map<String, ColumnValue>> subBatch = records.subList(i, toIndex);
-            ingestColumnarChunkWithSchema(tableName, schema, subBatch);
+            // Partition ingestion into batches of at most config.getColumnarMaxRows()
+            int maxRowsPerChunk = Math.max(1, config.getColumnarMaxRows());
+            for (int i = 0; i < records.size(); i += maxRowsPerChunk) {
+                int toIndex = Math.min(i + maxRowsPerChunk, records.size());
+                List<Map<String, ColumnValue>> subBatch = records.subList(i, toIndex);
+                ingestColumnarChunkWithSchema(tableName, schema, subBatch);
+            }
+        } finally {
+            exitOperation();
         }
     }
 
@@ -789,20 +886,24 @@ public class HybridStorageManager implements StorageEngine {
     public List<ColumnarChunk> getColumnarChunks(String tableName) {
         if (tableName == null) return Collections.emptyList();
         List<ColumnarChunk> chunks = columnarTables.get(tableName);
-        return chunks != null ? chunks : Collections.emptyList();
+        return chunks != null ? Collections.unmodifiableList(chunks) : Collections.emptyList();
     }
 
     @Override
     public Map<String, Object> getMetrics() {
-        Map<String, Object> metrics = new HashMap<>();
+        Map<String, Object> metrics = new LinkedHashMap<>();
+        metrics.put("lifecycleState", lifecycleState.get().name());
+        metrics.put("failureReason", failureReason != null ? failureReason : "none");
+        metrics.put("activeOperations", activeOperations.get());
         metrics.put("totalPuts", totalPuts.get());
         metrics.put("totalGets", totalGets.get());
         metrics.put("totalDeletes", totalDeletes.get());
         metrics.put("memtableHits", memtableHits.get());
         metrics.put("sstableHits", sstableHits.get());
         metrics.put("bloomFilterMisses", bloomFilterMisses.get());
-        metrics.put("memtableBytes", activeMemTable.getByteSize());
-        metrics.put("memtableRecords", activeMemTable.size());
+        metrics.put("activeMemTableRecords", activeMemTable != null ? activeMemTable.getRecordCount() : 0);
+        metrics.put("activeMemTableBytes", activeMemTable != null ? activeMemTable.getByteSize() : 0);
+        metrics.put("immutableMemTablesCount", immutableMemTables.size());
         metrics.put("sstableCount", sstables.size());
         metrics.put("columnarTablesCount", columnarTables.size());
 
@@ -825,7 +926,18 @@ public class HybridStorageManager implements StorageEngine {
             return; // Already closed
         }
 
-        // Stop background execution
+        // 1. Await admitted active operations to finish (up to 5s)
+        long deadline = System.currentTimeMillis() + 5000;
+        while (activeOperations.get() > 0 && System.currentTimeMillis() < deadline) {
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+
+        // 2. Stop background execution
         backgroundExecutor.shutdown();
         boolean terminated = false;
         try {
@@ -839,9 +951,9 @@ public class HybridStorageManager implements StorageEngine {
             Thread.currentThread().interrupt();
         }
 
-        if (!terminated) {
+        if (!terminated || activeOperations.get() > 0) {
             // Do NOT close resources in use! Leave in CLOSING state and report failure clearly.
-            throw new IOException("Storage background workers did not terminate within bounded timeout (10s); resources kept open. Retry close() after workers stop.");
+            throw new IOException("Storage operations (" + activeOperations.get() + " active) or background workers did not terminate within bounded timeout; resources kept open. Retry close() after workers stop.");
         }
 
         rwLock.writeLock().lock();
