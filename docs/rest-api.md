@@ -5,13 +5,16 @@ The AetherDB HTTP Gateway runs on Java Virtual Threads, providing non-blocking J
 
 ---
 
-## 2. Security Controls
+## 2. Security Controls & Hardening
 
-- **HTTP Method Enforcement**: Each endpoint enforces its designated method and responds with `405 Method Not Allowed` for invalid methods.
+- **Mandatory Authentication on External Interfaces**: When binding to `0.0.0.0` or any external non-loopback network interface, authentication is strictly required. Blank or empty tokens are rejected.
+- **Timing Attack Mitigation**: Token verification uses constant-time byte comparison (`MessageDigest.isEqual()`) to prevent timing side-channel attacks.
+- **HTTP Method Enforcement**: Each endpoint enforces its designated HTTP method and returns `405 Method Not Allowed` for invalid methods.
 - **Payload Limits**: Requests exceeding `server.max.request.body.bytes` (default 10 MB) are rejected with `413 Payload Too Large`.
-- **Authentication**: When `server.auth.enabled=true`, all incoming requests must supply `Authorization: Bearer <token>`. Unauthorized requests return `401 Unauthorized`.
-- **CORS**: Configurable via `server.cors.allowed.origins` (default `*`).
-- **Safe JSON Handling**: Handled via Jackson Core/Databind, properly parsing and escaping quotes, backslashes, control characters, and Unicode.
+- **Malformed Payload Protection**: Syntax errors or malformed JSON payloads return `400 Bad Request` with structured error descriptions.
+- **Raft Endpoint Protection**: When distributed Raft consensus is disabled (`raft.enabled=false`), all `/raft/*` consensus endpoints respond with `404 Not Found`.
+- **CORS Allowlist Validation**: Strict matching of incoming `Origin` headers against configured allowlist (`server.cors.allowed.origins`).
+- **Safe JSON & Type Handling**: Jackson Databind handles serialization and deserialization, safely parsing quotes, escape sequences, control characters, and Unicode. Untyped JSON nulls are handled gracefully without corrupting column type inference.
 
 ---
 
@@ -108,4 +111,3 @@ Returns node ID, consensus role, and partition ring topology.
 
 #### `GET /api/v1/metrics`
 Returns real-time engine telemetry (puts, gets, hits, misses, SSTable counts, row counts).
-

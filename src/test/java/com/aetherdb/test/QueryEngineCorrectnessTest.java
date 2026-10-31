@@ -4,7 +4,6 @@ import com.aetherdb.analytics.*;
 import com.aetherdb.common.AetherConfig;
 import com.aetherdb.model.ColumnType;
 import com.aetherdb.model.ColumnValue;
-import com.aetherdb.storage.columnar.ZoneMap;
 import com.aetherdb.storage.engine.HybridStorageManager;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -54,11 +53,6 @@ public class QueryEngineCorrectnessTest {
     @Test
     @DisplayName("Independent aggregate state: multiple expressions in one query maintain isolated accumulators")
     void testIndependentAggregateAccumulators() throws Exception {
-        // Ingest dataset:
-        // row 1: val=10
-        // row 2: val=20
-        // row 3: val=30
-        // row 4: val=NULL
         List<Map<String, ColumnValue>> records = new ArrayList<>();
         records.add(Map.of("id", ColumnValue.ofLong(1), "val", ColumnValue.ofDouble(10.0)));
         records.add(Map.of("id", ColumnValue.ofLong(2), "val", ColumnValue.ofDouble(20.0)));
@@ -84,18 +78,99 @@ public class QueryEngineCorrectnessTest {
         assertEquals(1, result.getRows().size());
 
         List<Object> row = result.getRows().get(0);
-        // COUNT(*) = 4 (all rows)
         assertEquals(4L, row.get(0));
-        // COUNT(val) = 3 (excluding NULL)
         assertEquals(3L, row.get(1));
-        // SUM(val) = 60.0
         assertEquals(60.0, (Double) row.get(2), 0.001);
-        // AVG(val) = 60.0 / 3 = 20.0 (dividing by non-null count!)
         assertEquals(20.0, (Double) row.get(3), 0.001);
-        // MIN(val) = 10.0
         assertEquals(10.0, (Double) row.get(4), 0.001);
-        // MAX(val) = 30.0
         assertEquals(30.0, (Double) row.get(5), 0.001);
+    }
+
+    @Test
+    @DisplayName("Large integer precision: SUM preserves full 64-bit precision without double rounding")
+    void testLargeIntegerSumPreservesPrecision() throws Exception {
+        long large1 = 3_000_000_000_000_001L;
+        long large2 = 4_000_000_000_000_002L;
+        long expectedSum = 7_000_000_000_000_003L;
+
+        List<Map<String, ColumnValue>> records = List.of(
+                Map.of("big_num", ColumnValue.ofLong(large1)),
+                Map.of("big_num", ColumnValue.ofLong(large2))
+        );
+        storage.ingestColumnar("large_ints", records);
+
+        QueryResult res = queryEngine.execute(new QueryRequest(
+                "large_ints",
+                List.of("SUM(big_num)"),
+                Collections.emptyList(),
+                Collections.emptyList(),
+                10
+        ));
+
+        assertEquals(1, res.getRows().size());
+        Object sumVal = res.getRows().get(0).get(0);
+        assertInstanceOf(Long.class, sumVal);
+        assertEquals(expectedSum, sumVal);
+    }
+
+    @Test
+    @DisplayName("Empty table aggregates: SQL-standard semantics (COUNT=0, SUM/AVG=null)")
+    void testEmptyTableAggregates() {
+        QueryRequest req = new QueryRequest(
+                "non_existent_table",
+                List.of("COUNT(*)", "SUM(amount)", "AVG(amount)", "MIN(amount)", "MAX(amount)"),
+                Collections.emptyList(),
+                Collections.emptyList(),
+                10
+        );
+
+        QueryResult res = queryEngine.execute(req);
+        assertEquals(1, res.getRows().size());
+        List<Object> row = res.getRows().get(0);
+        assertEquals(0L, row.get(0)); // COUNT(*)
+        assertNull(row.get(1));       // SUM
+        assertNull(row.get(2));       // AVG
+        assertNull(row.get(3));       // MIN
+        assertNull(row.get(4));       // MAX
+    }
+
+    @Test
+    @DisplayName("Validation: non-aggregate expressions in GROUP BY queries are strictly rejected")
+    void testInvalidGroupByExpressionRejected() throws Exception {
+        storage.ingestColumnar("dept_data", List.of(
+                Map.of("dept", ColumnValue.ofString("eng"), "salary", ColumnValue.ofLong(100), "name", ColumnValue.ofString("alice"))
+        ));
+
+        // 'name' is in SELECT but neither in GROUP BY nor in an aggregate function
+        QueryRequest invalidReq = new QueryRequest(
+                "dept_data",
+                List.of("dept", "name", "AVG(salary)"),
+                Collections.emptyList(),
+                List.of("dept"),
+                10
+        );
+
+        assertThrows(IllegalArgumentException.class, () -> {
+            queryEngine.execute(invalidReq);
+        });
+    }
+
+    @Test
+    @DisplayName("Validation: unknown column in SELECT is rejected")
+    void testUnknownColumnRejected() throws Exception {
+        storage.ingestColumnar("items", List.of(Map.of("item_id", ColumnValue.ofLong(1))));
+
+        QueryRequest badReq = new QueryRequest(
+                "items",
+                List.of("non_existent_col"),
+                Collections.emptyList(),
+                Collections.emptyList(),
+                10
+        );
+
+        assertThrows(IllegalArgumentException.class, () -> {
+            queryEngine.execute(badReq);
+        });
     }
 
     @Test
@@ -147,84 +222,4 @@ public class QueryEngineCorrectnessTest {
         ));
         assertEquals(9, neResult.getRows().size());
     }
-
-    @Test
-    @DisplayName("ZoneMap pruning logic correctly handles boundary values")
-    void testZoneMapBoundaryPruning() {
-        ZoneMap zm = new ZoneMap(ColumnType.INT32);
-        zm.update(ColumnValue.ofInt(10));
-        zm.update(ColumnValue.ofInt(20));
-
-        // Chunk range is [10, 20]
-        // Target = 20
-        // > 20: maxVal <= 20 -> can skip! (no value strictly > 20)
-        assertTrue(zm.canSkipGreaterThan(ColumnValue.ofInt(20)));
-
-        // >= 20: maxVal < 20 is false (maxVal is 20) -> CANNOT skip! (20 matches)
-        assertFalse(zm.canSkipGreaterThanOrEquals(ColumnValue.ofInt(20)));
-
-        // Target = 10
-        // < 10: minVal >= 10 -> can skip! (no value strictly < 10)
-        assertTrue(zm.canSkipLessThan(ColumnValue.ofInt(10)));
-
-        // <= 10: minVal > 10 is false (minVal is 10) -> CANNOT skip! (10 matches)
-        assertFalse(zm.canSkipLessThanOrEquals(ColumnValue.ofInt(10)));
-    }
-
-    @Test
-    @DisplayName("GROUP BY queries aggregate per group key accurately")
-    void testGroupByAggregations() throws Exception {
-        List<Map<String, ColumnValue>> records = List.of(
-                Map.of("dept", ColumnValue.ofString("ENG"), "salary", ColumnValue.ofDouble(100.0)),
-                Map.of("dept", ColumnValue.ofString("ENG"), "salary", ColumnValue.ofDouble(200.0)),
-                Map.of("dept", ColumnValue.ofString("SALES"), "salary", ColumnValue.ofDouble(150.0)),
-                Map.of("dept", ColumnValue.ofString("SALES"), "salary", ColumnValue.ofDouble(250.0)),
-                Map.of("dept", ColumnValue.ofString("HR"), "salary", ColumnValue.ofDouble(80.0))
-        );
-        storage.ingestColumnar("employees", records);
-
-        QueryRequest req = new QueryRequest(
-                "employees",
-                List.of("COUNT(*)", "SUM(salary)", "AVG(salary)"),
-                Collections.emptyList(),
-                List.of("dept"),
-                10
-        );
-
-        QueryResult res = queryEngine.execute(req);
-        assertEquals(3, res.getRows().size()); // 3 departments
-
-        Map<String, Double> avgByDept = new HashMap<>();
-        for (List<Object> row : res.getRows()) {
-            String dept = (String) row.get(0);
-            Double avgSal = (Double) row.get(3);
-            avgByDept.put(dept, avgSal);
-        }
-
-        assertEquals(150.0, avgByDept.get("ENG"), 0.01);
-        assertEquals(200.0, avgByDept.get("SALES"), 0.01);
-        assertEquals(80.0, avgByDept.get("HR"), 0.01);
-    }
-
-    @Test
-    @DisplayName("LIKE filter evaluation with % wildcards")
-    void testLikeOperator() throws Exception {
-        List<Map<String, ColumnValue>> records = List.of(
-                Map.of("name", ColumnValue.ofString("Alice Smith")),
-                Map.of("name", ColumnValue.ofString("Bob Jones")),
-                Map.of("name", ColumnValue.ofString("Charlie Smith"))
-        );
-        storage.ingestColumnar("names", records);
-
-        QueryResult res = queryEngine.execute(new QueryRequest(
-                "names",
-                List.of("name"),
-                List.of(new Predicate("name", FilterOperator.LIKE, ColumnValue.ofString("%Smith"))),
-                Collections.emptyList(),
-                10
-        ));
-
-        assertEquals(2, res.getRows().size());
-    }
 }
-

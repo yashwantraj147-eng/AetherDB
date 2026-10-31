@@ -19,6 +19,10 @@ public class ColumnDecoder {
         this.type = type;
     }
 
+    public static List<ColumnValue> decode(byte[] data, ColumnType type, int rowCount) {
+        return new ColumnDecoder(type).decode(data);
+    }
+
     /**
      * Decodes compressed column bytes into a list of typed ColumnValues.
      */
@@ -76,11 +80,11 @@ public class ColumnDecoder {
         int runCount = BinaryUtils.readVarInt(buf);
         List<ColumnValue> list = new ArrayList<>(rowCount);
 
-        for (int i = 0; i < runCount; i++) {
-            int runLen = BinaryUtils.readVarInt(buf);
+        for (int r = 0; r < runCount; r++) {
+            int runLength = BinaryUtils.readVarInt(buf);
             byte notNull = buf.get();
             ColumnValue val = (notNull == 0) ? ColumnValue.ofNull(type) : readValue(buf);
-            for (int r = 0; r < runLen; r++) {
+            for (int i = 0; i < runLength; i++) {
                 list.add(val);
             }
         }
@@ -91,10 +95,10 @@ public class ColumnDecoder {
         return switch (type) {
             case INT32 -> ColumnValue.ofInt(buf.getInt());
             case INT64 -> ColumnValue.ofLong(buf.getLong());
-            case TIMESTAMP -> ColumnValue.ofTimestamp(buf.getLong());
             case FLOAT64 -> ColumnValue.ofDouble(buf.getDouble());
             case STRING -> ColumnValue.ofString(BinaryUtils.readString(buf));
-            case BOOLEAN -> ColumnValue.ofBoolean(buf.get() == 1);
+            case BOOLEAN -> ColumnValue.ofBoolean(buf.get() != 0);
+            case TIMESTAMP -> ColumnValue.ofTimestamp(buf.getLong());
         };
     }
 }

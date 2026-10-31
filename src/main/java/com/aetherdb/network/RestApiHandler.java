@@ -31,14 +31,21 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.*;
 
 /**
  * Production REST API Handler for Key-Value, Columnar Analytics, and Raft Consensus.
  * Enforces strict HTTP methods, Jackson JSON parsing/serialization, bounded request sizes,
- * configurable authentication and CORS, and table name validation.
+ * constant-time authentication, CORS origin validation, and clean error reporting.
  */
 public class RestApiHandler implements HttpHandler {
+
+    private static class PayloadTooLargeException extends RuntimeException {
+        public PayloadTooLargeException(String message) {
+            super(message);
+        }
+    }
 
     private final AetherConfig config;
     private final StorageEngine storageEngine;
@@ -74,6 +81,14 @@ public class RestApiHandler implements HttpHandler {
         if (config.isAuthEnabled() && !isAuthorized(exchange)) {
             sendResponse(exchange, 401, "{\"error\":\"Unauthorized: Invalid or missing authentication token\"}");
             return;
+        }
+
+        // 3. Raft endpoint gate
+        if (path.startsWith("/api/v1/cluster") || path.startsWith("/api/v1/raft")) {
+            if (!config.isRaftEnabled()) {
+                sendResponse(exchange, 404, "{\"error\":\"Raft consensus module is disabled in configuration\"}");
+                return;
+            }
         }
 
         try {
@@ -116,6 +131,10 @@ public class RestApiHandler implements HttpHandler {
                 }
                 default -> sendResponse(exchange, 404, "{\"error\":\"Endpoint not found: " + path + "\"}");
             }
+        } catch (PayloadTooLargeException e) {
+            sendResponse(exchange, 413, "{\"error\":\"" + escapeJson(e.getMessage()) + "\"}");
+        } catch (JsonProcessingException e) {
+            sendResponse(exchange, 400, "{\"error\":\"Malformed JSON: " + escapeJson(e.getMessage()) + "\"}");
         } catch (IllegalArgumentException e) {
             sendResponse(exchange, 400, "{\"error\":\"" + escapeJson(e.getMessage()) + "\"}");
         } catch (Exception e) {
@@ -140,10 +159,31 @@ public class RestApiHandler implements HttpHandler {
         String authHeader = exchange.getRequestHeaders().getFirst("Authorization");
         if (authHeader == null) return false;
         String token = authHeader.startsWith("Bearer ") ? authHeader.substring(7).trim() : authHeader.trim();
-        return !config.getAuthToken().isEmpty() && config.getAuthToken().equals(token);
+        if (token.isEmpty() || config.getAuthToken().trim().isEmpty()) {
+            return false;
+        }
+        byte[] tokenBytes = token.getBytes(StandardCharsets.UTF_8);
+        byte[] expectedBytes = config.getAuthToken().getBytes(StandardCharsets.UTF_8);
+        return MessageDigest.isEqual(tokenBytes, expectedBytes);
     }
 
     private void handleCorsPreflight(HttpExchange exchange) throws IOException {
+        String allowed = config.getCorsAllowedOrigins();
+        String origin = exchange.getRequestHeaders().getFirst("Origin");
+        if (!"*".equals(allowed) && origin != null) {
+            String[] allowedList = allowed.split(",");
+            boolean matched = false;
+            for (String a : allowedList) {
+                if (a.trim().equalsIgnoreCase(origin.trim())) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                sendResponse(exchange, 403, "{\"error\":\"CORS origin not allowed\"}");
+                return;
+            }
+        }
         setCorsHeaders(exchange);
         exchange.getResponseHeaders().set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
         exchange.getResponseHeaders().set("Access-Control-Allow-Headers", "Content-Type, Authorization");
@@ -151,7 +191,21 @@ public class RestApiHandler implements HttpHandler {
     }
 
     private void setCorsHeaders(HttpExchange exchange) {
-        exchange.getResponseHeaders().set("Access-Control-Allow-Origin", config.getCorsAllowedOrigins());
+        String allowed = config.getCorsAllowedOrigins();
+        if ("*".equals(allowed)) {
+            exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+        } else {
+            String origin = exchange.getRequestHeaders().getFirst("Origin");
+            if (origin != null) {
+                String[] allowedList = allowed.split(",");
+                for (String a : allowedList) {
+                    if (a.trim().equalsIgnoreCase(origin.trim())) {
+                        exchange.getResponseHeaders().set("Access-Control-Allow-Origin", origin);
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     private void handleKvPut(HttpExchange exchange) throws IOException {
@@ -220,15 +274,16 @@ public class RestApiHandler implements HttpHandler {
         }
 
         if (key == null) {
-            sendResponse(exchange, 400, "{\"error\":\"Missing 'key' parameter\"}");
+            sendResponse(exchange, 400, "{\"error\":\"Missing 'key' in query parameter or JSON body\"}");
             return;
         }
 
         storageEngine.delete(key);
-        ObjectNode res = mapper.createObjectNode();
-        res.put("status", "deleted");
-        res.put("key", key);
-        sendResponse(exchange, 200, mapper.writeValueAsString(res));
+
+        ObjectNode response = mapper.createObjectNode();
+        response.put("status", "ok");
+        response.put("deletedKey", key);
+        sendResponse(exchange, 200, mapper.writeValueAsString(response));
     }
 
     private void handleAnalyticsIngest(HttpExchange exchange) throws IOException {
@@ -239,13 +294,16 @@ public class RestApiHandler implements HttpHandler {
         }
 
         JsonNode root = mapper.readTree(bodyBytes);
-        String table = root.has("table") ? root.get("table").asText() : "default";
-
+        if (!root.has("table") || !root.get("table").isTextual()) {
+            sendResponse(exchange, 400, "{\"error\":\"Missing required string field 'table'\"}");
+            return;
+        }
         if (!root.has("records") || !root.get("records").isArray()) {
-            sendResponse(exchange, 400, "{\"error\":\"Missing 'records' array in ingestion payload\"}");
+            sendResponse(exchange, 400, "{\"error\":\"Missing required array field 'records'\"}");
             return;
         }
 
+        String table = root.get("table").asText();
         ArrayNode recordsArray = (ArrayNode) root.get("records");
         List<Map<String, ColumnValue>> records = new ArrayList<>(recordsArray.size());
 
@@ -265,7 +323,7 @@ public class RestApiHandler implements HttpHandler {
 
                 ColumnValue cv;
                 if (val.isNull()) {
-                    cv = ColumnValue.ofNull(ColumnType.STRING);
+                    cv = ColumnValue.ofNull(); // Untyped null
                 } else if (val.isBoolean()) {
                     cv = ColumnValue.ofBoolean(val.asBoolean());
                 } else if (val.isIntegralNumber()) {
@@ -286,6 +344,7 @@ public class RestApiHandler implements HttpHandler {
         res.put("status", "ingested");
         res.put("table", table);
         res.put("records", records.size());
+        res.put("rowsIngested", records.size());
         sendResponse(exchange, 200, mapper.writeValueAsString(res));
     }
 
@@ -297,25 +356,28 @@ public class RestApiHandler implements HttpHandler {
         }
 
         JsonNode root = mapper.readTree(bodyBytes);
-        String table = root.has("table") ? root.get("table").asText() : "default";
-
-        List<String> selectList = new ArrayList<>();
-        if (root.has("select") && root.get("select").isArray()) {
-            for (JsonNode s : root.get("select")) {
-                selectList.add(s.asText());
-            }
-        } else if (root.has("select") && root.get("select").isTextual()) {
-            for (String part : root.get("select").asText().split(",")) {
-                if (!part.trim().isEmpty()) selectList.add(part.trim());
-            }
+        if (!root.has("table") || !root.get("table").isTextual()) {
+            sendResponse(exchange, 400, "{\"error\":\"Missing required string field 'table'\"}");
+            return;
         }
-        if (selectList.isEmpty()) {
-            selectList.add("COUNT(*)");
+        if (!root.has("select") || !root.get("select").isArray() || root.get("select").isEmpty()) {
+            sendResponse(exchange, 400, "{\"error\":\"Missing required non-empty array 'select'\"}");
+            return;
+        }
+
+        String table = root.get("table").asText();
+        List<String> selectExprs = new ArrayList<>();
+        for (JsonNode sel : root.get("select")) {
+            selectExprs.add(sel.asText());
         }
 
         List<Predicate> predicates = new ArrayList<>();
         if (root.has("predicates") && root.get("predicates").isArray()) {
             for (JsonNode pNode : root.get("predicates")) {
+                if (!pNode.has("column") || !pNode.has("op")) {
+                    sendResponse(exchange, 400, "{\"error\":\"Predicate must specify both 'column' and 'op'\"}");
+                    return;
+                }
                 String col = pNode.get("column").asText();
                 String opStr = pNode.get("op").asText();
                 FilterOperator op = FilterOperator.fromString(opStr);
@@ -323,7 +385,7 @@ public class RestApiHandler implements HttpHandler {
 
                 ColumnValue targetVal;
                 if (vNode == null || vNode.isNull()) {
-                    targetVal = ColumnValue.ofNull(ColumnType.STRING);
+                    targetVal = ColumnValue.ofNull();
                 } else if (vNode.isIntegralNumber()) {
                     targetVal = ColumnValue.ofLong(vNode.asLong());
                 } else if (vNode.isFloatingPointNumber()) {
@@ -345,16 +407,11 @@ public class RestApiHandler implements HttpHandler {
             }
         }
 
-        int limit = root.has("limit") ? root.get("limit").asInt(100) : 100;
-        QueryRequest req = new QueryRequest(table, selectList, predicates, groupByCols, limit);
-        QueryResult result = queryEngine.execute(req);
+        int limit = root.has("limit") ? root.get("limit").asInt() : 1000;
+        QueryRequest request = new QueryRequest(table, selectExprs, predicates, groupByCols, limit);
+        QueryResult result = queryEngine.execute(request);
 
         ObjectNode res = mapper.createObjectNode();
-        res.put("executionTimeMs", result.getExecutionTimeMs());
-        res.put("scannedChunks", result.getScannedChunks());
-        res.put("skippedChunks", result.getSkippedChunks());
-        res.put("totalRowsProcessed", result.getTotalRowsProcessed());
-
         ArrayNode colsArr = res.putArray("columns");
         for (String c : result.getColumns()) {
             colsArr.add(c);
@@ -363,61 +420,64 @@ public class RestApiHandler implements HttpHandler {
         ArrayNode rowsArr = res.putArray("rows");
         for (List<Object> row : result.getRows()) {
             ArrayNode rowArr = rowsArr.addArray();
-            for (Object item : row) {
-                if (item == null) {
-                    rowArr.addNull();
-                } else if (item instanceof Number n) {
-                    if (n instanceof Double || n instanceof Float) {
-                        rowArr.add(n.doubleValue());
-                    } else {
-                        rowArr.add(n.longValue());
-                    }
-                } else if (item instanceof Boolean b) {
-                    rowArr.add(b);
-                } else {
-                    rowArr.add(item.toString());
+            for (Object v : row) {
+                if (v == null) rowArr.addNull();
+                else if (v instanceof Number n) {
+                    if (v instanceof Long || v instanceof Integer || v instanceof Short || v instanceof Byte) rowArr.add(n.longValue());
+                    else rowArr.add(n.doubleValue());
                 }
+                else if (v instanceof Boolean b) rowArr.add(b);
+                else rowArr.add(v.toString());
             }
         }
+
+        res.put("executionTimeMs", result.getExecutionTimeMs());
+        res.put("rowsProcessed", result.getTotalRowsProcessed());
+        res.put("scannedChunks", result.getScannedChunks());
+        res.put("skippedChunks", result.getSkippedChunks());
 
         sendResponse(exchange, 200, mapper.writeValueAsString(res));
     }
 
     private void handleClusterStatus(HttpExchange exchange) throws IOException {
         ObjectNode res = mapper.createObjectNode();
-        res.put("nodeId", raftNode.getNodeId());
-        res.put("role", raftNode.getCurrentRole().name());
-        res.put("leaderId", raftNode.getCurrentLeaderId() != null ? raftNode.getCurrentLeaderId() : "none");
-        res.put("term", raftNode.getCurrentTerm());
-        res.put("isLeader", raftNode.isLeader());
-        res.put("ringSize", router.getRingSize());
-        res.put("physicalNodesCount", router.getPhysicalNodes().size());
-        res.put("raftStatus", "EXPERIMENTAL_PROTOTYPE");
+        res.put("status", "ok");
+        res.put("nodeId", raftNode != null ? raftNode.getNodeId() : "standalone");
+        res.put("state", raftNode != null ? raftNode.getCurrentRole().name() : "STANDALONE");
+        res.put("term", raftNode != null ? raftNode.getState().getCurrentTerm() : 0);
+        res.put("totalVNodes", router != null ? router.getRingSize() : 0);
+
         sendResponse(exchange, 200, mapper.writeValueAsString(res));
     }
 
     private void handleMetrics(HttpExchange exchange) throws IOException {
-        Map<String, Object> metrics = storageEngine.getMetrics();
+        Map<String, Object> storageMetrics = storageEngine.getMetrics();
         ObjectNode res = mapper.createObjectNode();
-        for (Map.Entry<String, Object> e : metrics.entrySet()) {
+        res.put("status", "ok");
+
+        ObjectNode st = res.putObject("storage");
+        for (Map.Entry<String, Object> e : storageMetrics.entrySet()) {
             if (e.getValue() instanceof Number n) {
-                res.put(e.getKey(), n.longValue());
+                st.put(e.getKey(), n.longValue());
             } else {
-                res.put(e.getKey(), String.valueOf(e.getValue()));
+                st.put(e.getKey(), String.valueOf(e.getValue()));
             }
         }
+
+        if (raftNode != null) {
+            ObjectNode rf = res.putObject("raft");
+            rf.put("nodeId", raftNode.getNodeId());
+            rf.put("state", raftNode.getCurrentRole().name());
+            rf.put("currentTerm", raftNode.getState().getCurrentTerm());
+            rf.put("commitIndex", raftNode.getState().getCommitIndex());
+        }
+
         sendResponse(exchange, 200, mapper.writeValueAsString(res));
     }
 
     private void handleRaftRequestVote(HttpExchange exchange) throws IOException {
         byte[] bodyBytes = readBody(exchange);
-        JsonNode root = mapper.readTree(bodyBytes);
-        long term = root.get("term").asLong();
-        String candidateId = root.get("candidateId").asText();
-        long lastLogIndex = root.get("lastLogIndex").asLong();
-        long lastLogTerm = root.get("lastLogTerm").asLong();
-
-        RequestVoteArgs args = new RequestVoteArgs(term, candidateId, lastLogIndex, lastLogTerm);
+        RequestVoteArgs args = mapper.readValue(bodyBytes, RequestVoteArgs.class);
         RequestVoteReply reply = raftNode.handleRequestVote(args);
 
         ObjectNode res = mapper.createObjectNode();
@@ -428,14 +488,7 @@ public class RestApiHandler implements HttpHandler {
 
     private void handleRaftAppendEntries(HttpExchange exchange) throws IOException {
         byte[] bodyBytes = readBody(exchange);
-        JsonNode root = mapper.readTree(bodyBytes);
-        long term = root.get("term").asLong();
-        String leaderId = root.get("leaderId").asText();
-        long prevLogIndex = root.get("prevLogIndex").asLong();
-        long prevLogTerm = root.get("prevLogTerm").asLong();
-        long leaderCommit = root.get("leaderCommit").asLong();
-
-        AppendEntriesArgs args = new AppendEntriesArgs(term, leaderId, prevLogIndex, prevLogTerm, Collections.emptyList(), leaderCommit);
+        AppendEntriesArgs args = mapper.readValue(bodyBytes, AppendEntriesArgs.class);
         AppendEntriesReply reply = raftNode.handleAppendEntries(args);
 
         ObjectNode res = mapper.createObjectNode();
@@ -455,7 +508,7 @@ public class RestApiHandler implements HttpHandler {
             while ((read = in.read(buf)) != -1) {
                 total += read;
                 if (total > maxBytes) {
-                    throw new IllegalArgumentException("Payload too large: request body exceeds maximum limit of " + maxBytes + " bytes");
+                    throw new PayloadTooLargeException("Payload too large: request body exceeds maximum limit of " + maxBytes + " bytes");
                 }
                 baos.write(buf, 0, read);
             }

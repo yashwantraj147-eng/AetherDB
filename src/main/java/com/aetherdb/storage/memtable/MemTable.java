@@ -7,18 +7,30 @@ import java.util.Collection;
 import java.util.Iterator;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Concurrent in-memory buffer for AetherDB LSM-Tree.
  * Uses ConcurrentSkipListMap keyed by raw byte array with custom lexicographical comparator.
  * Enforces sequence-number monotonicity: an older sequence number will never overwrite
  * a newer sequence number for the same key.
+ * Tracks explicit lifecycle states to prevent duplicate flush executions.
  */
 public class MemTable implements Iterable<DataRecord> {
+
+    public enum State {
+        ACTIVE,
+        SEALED,
+        QUEUED,
+        FLUSHING,
+        INSTALLED,
+        FAILED
+    }
 
     private final long id;
     private final ConcurrentSkipListMap<byte[], DataRecord> map;
     private final AtomicLong byteSize = new AtomicLong(0);
+    private final AtomicReference<State> state = new AtomicReference<>(State.ACTIVE);
 
     private volatile long minSequenceNumber = Long.MAX_VALUE;
     private volatile long maxSequenceNumber = Long.MIN_VALUE;
@@ -26,6 +38,18 @@ public class MemTable implements Iterable<DataRecord> {
     public MemTable(long id) {
         this.id = id;
         this.map = new ConcurrentSkipListMap<>(BinaryUtils::compareBytes);
+    }
+
+    public State getState() {
+        return state.get();
+    }
+
+    public boolean transitionTo(State expected, State newState) {
+        return state.compareAndSet(expected, newState);
+    }
+
+    public void setState(State newState) {
+        state.set(newState);
     }
 
     public long getId() {

@@ -14,6 +14,7 @@ import java.util.concurrent.Executors;
 /**
  * Embedded HTTP Gateway for AetherDB powered by Java Virtual Threads.
  * Supports concurrent client connections with JSON REST and dashboard endpoints.
+ * Enforces mandatory authentication for external network bindings.
  */
 public class HttpApiServer implements AutoCloseable {
 
@@ -25,8 +26,22 @@ public class HttpApiServer implements AutoCloseable {
         this.port = config.getNodePort();
         String host = config.getNodeHost();
 
-        if ("0.0.0.0".equals(host) && !config.isAuthEnabled()) {
-            System.err.println("WARNING: Server bound to 0.0.0.0 with authentication disabled! Endpoints are open to external network access.");
+        // Enforce external bind authentication policy:
+        // If server is bound to 0.0.0.0 or a non-loopback address, authentication is mandatory
+        boolean isLoopback = "127.0.0.1".equals(host) || "localhost".equalsIgnoreCase(host);
+        if (!isLoopback) {
+            if (!config.isAuthEnabled()) {
+                throw new SecurityException("Server bound to external interface (" + host
+                        + ") but auth.enabled is false! Authentication is mandatory for external network access.");
+            }
+            if (config.getAuthToken() == null || config.getAuthToken().trim().isEmpty()) {
+                throw new SecurityException("Server bound to external interface (" + host
+                        + ") with empty auth token! A non-empty auth token is mandatory.");
+            }
+        } else if (config.isAuthEnabled()) {
+            if (config.getAuthToken() == null || config.getAuthToken().trim().isEmpty()) {
+                throw new SecurityException("auth.enabled is true but auth.token is empty!");
+            }
         }
 
         this.server = HttpServer.create(new InetSocketAddress(host, port), 0);

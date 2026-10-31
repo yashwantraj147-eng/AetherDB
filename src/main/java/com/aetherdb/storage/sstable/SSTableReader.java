@@ -2,6 +2,7 @@ package com.aetherdb.storage.sstable;
 
 import com.aetherdb.common.BinaryUtils;
 import com.aetherdb.common.BloomFilter;
+import com.aetherdb.common.Constants;
 import com.aetherdb.model.DataRecord;
 
 import java.io.EOFException;
@@ -21,6 +22,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * Implements reference counting to protect active readers from accessing closed or
  * prematurely deleted SSTable files during concurrent compactions.
+ * Validates header magic, version, footer magic, non-overlapping regions, and record integrity.
  */
 public class SSTableReader implements AutoCloseable, Iterable<DataRecord> {
 
@@ -40,65 +42,95 @@ public class SSTableReader implements AutoCloseable, Iterable<DataRecord> {
         this.sstableFile = sstableFile;
         this.channel = FileChannel.open(sstableFile.toPath(), StandardOpenOption.READ);
 
-        long fileSize = channel.size();
-        if (fileSize < 10) {
-            channel.close();
-            throw new CorruptedSSTableException("SSTable file too small: " + fileSize + " in " + sstableFile.getName());
-        }
-
-        // 1. Read trailing footer length
-        ByteBuffer lenBuf = ByteBuffer.allocate(4);
-        readFully(channel, lenBuf, fileSize - 4);
-        lenBuf.flip();
-        int footerLen = lenBuf.getInt();
-
-        if (footerLen <= 0 || footerLen > MAX_FOOTER_SIZE || footerLen > fileSize - 10) {
-            channel.close();
-            throw new CorruptedSSTableException("Invalid SSTable footer length: " + footerLen + " in " + sstableFile.getName());
-        }
-
-        // 2. Read footer metadata
-        ByteBuffer footerBuf = ByteBuffer.allocate(footerLen);
-        readFully(channel, footerBuf, fileSize - 4 - footerLen);
-        footerBuf.flip();
         try {
-            this.metadata = SSTableMetadata.deserialize(footerBuf);
-        } catch (Exception e) {
-            channel.close();
-            throw new CorruptedSSTableException("Failed to parse SSTable metadata in " + sstableFile.getName() + ": " + e.getMessage(), e);
-        }
+            long fileSize = channel.size();
+            if (fileSize < 16) {
+                throw new CorruptedSSTableException("SSTable file too small: " + fileSize + " bytes in " + sstableFile.getName());
+            }
 
-        // Validate block offsets against file boundary
-        long maxPayloadBoundary = fileSize - 4 - footerLen;
-        if (metadata.getIndexOffset() + metadata.getIndexLength() > maxPayloadBoundary) {
-            channel.close();
-            throw new CorruptedSSTableException("IndexBlock offset exceeds file bounds in " + sstableFile.getName());
-        }
-        if (metadata.getBloomOffset() + metadata.getBloomLength() > maxPayloadBoundary) {
-            channel.close();
-            throw new CorruptedSSTableException("BloomFilter offset exceeds file bounds in " + sstableFile.getName());
-        }
+            // 1. Read and validate 6-byte header magic and version
+            ByteBuffer headerBuf = ByteBuffer.allocate(6);
+            readFully(channel, headerBuf, 0);
+            headerBuf.flip();
+            int headerMagic = headerBuf.getInt();
+            short headerVersion = headerBuf.getShort();
+            if (headerMagic != Constants.SSTABLE_MAGIC) {
+                throw new CorruptedSSTableException("Invalid SSTable header magic bytes: 0x"
+                        + Integer.toHexString(headerMagic) + " in " + sstableFile.getName());
+            }
+            if (headerVersion != Constants.SSTABLE_VERSION) {
+                throw new CorruptedSSTableException("Unsupported SSTable header version: "
+                        + headerVersion + " in " + sstableFile.getName());
+            }
 
-        // 3. Read Index Block
-        ByteBuffer indexBuf = ByteBuffer.allocate(metadata.getIndexLength());
-        readFully(channel, indexBuf, metadata.getIndexOffset());
-        indexBuf.flip();
-        try {
-            this.indexBlock = IndexBlock.deserialize(indexBuf);
-        } catch (Exception e) {
-            channel.close();
-            throw new CorruptedSSTableException("Failed to parse IndexBlock in " + sstableFile.getName() + ": " + e.getMessage(), e);
-        }
+            // 2. Read trailing footer length
+            ByteBuffer lenBuf = ByteBuffer.allocate(4);
+            readFully(channel, lenBuf, fileSize - 4);
+            lenBuf.flip();
+            int footerLen = lenBuf.getInt();
 
-        // 4. Read Bloom Filter
-        ByteBuffer bloomBuf = ByteBuffer.allocate(metadata.getBloomLength());
-        readFully(channel, bloomBuf, metadata.getBloomOffset());
-        bloomBuf.flip();
-        try {
-            this.bloomFilter = BloomFilter.deserialize(bloomBuf);
-        } catch (Exception e) {
-            channel.close();
-            throw new CorruptedSSTableException("Failed to parse BloomFilter in " + sstableFile.getName() + ": " + e.getMessage(), e);
+            if (footerLen <= 0 || footerLen > MAX_FOOTER_SIZE || footerLen > fileSize - 10) {
+                throw new CorruptedSSTableException("Invalid SSTable footer length: " + footerLen + " in " + sstableFile.getName());
+            }
+
+            long footerOffset = fileSize - 4 - footerLen;
+
+            // 3. Read footer metadata
+            ByteBuffer footerBuf = ByteBuffer.allocate(footerLen);
+            readFully(channel, footerBuf, footerOffset);
+            footerBuf.flip();
+            try {
+                this.metadata = SSTableMetadata.deserialize(footerBuf);
+            } catch (Exception e) {
+                throw new CorruptedSSTableException("Failed to parse SSTable metadata in " + sstableFile.getName() + ": " + e.getMessage(), e);
+            }
+
+            // 4. Validate non-overlapping regions and bounds
+            long indexOffset = metadata.getIndexOffset();
+            int indexLen = metadata.getIndexLength();
+            long bloomOffset = metadata.getBloomOffset();
+            int bloomLen = metadata.getBloomLength();
+
+            if (indexOffset < 6 || indexLen < 0 || bloomOffset < 6 || bloomLen < 0) {
+                throw new CorruptedSSTableException("Negative or invalid block offsets/lengths in " + sstableFile.getName());
+            }
+
+            if (indexOffset + (long) indexLen > bloomOffset) {
+                throw new CorruptedSSTableException("IndexBlock overlaps with BloomFilter in " + sstableFile.getName());
+            }
+
+            if (bloomOffset + (long) bloomLen > footerOffset) {
+                throw new CorruptedSSTableException("BloomFilter offset exceeds footer boundary in " + sstableFile.getName());
+            }
+
+            // 5. Read Index Block
+            ByteBuffer indexBuf = ByteBuffer.allocate(indexLen);
+            readFully(channel, indexBuf, indexOffset);
+            indexBuf.flip();
+            try {
+                this.indexBlock = IndexBlock.deserialize(indexBuf);
+            } catch (Exception e) {
+                throw new CorruptedSSTableException("Failed to parse IndexBlock in " + sstableFile.getName() + ": " + e.getMessage(), e);
+            }
+
+            // 6. Read Bloom Filter
+            ByteBuffer bloomBuf = ByteBuffer.allocate(bloomLen);
+            readFully(channel, bloomBuf, bloomOffset);
+            bloomBuf.flip();
+            try {
+                this.bloomFilter = BloomFilter.deserialize(bloomBuf);
+            } catch (Exception e) {
+                throw new CorruptedSSTableException("Failed to parse BloomFilter in " + sstableFile.getName() + ": " + e.getMessage(), e);
+            }
+        } catch (Throwable t) {
+            try {
+                channel.close();
+            } catch (IOException ignored) {}
+            if (t instanceof IOException) {
+                throw (IOException) t;
+            } else {
+                throw new CorruptedSSTableException("Corrupted SSTable file: " + sstableFile.getName() + " - " + t.getMessage(), t);
+            }
         }
     }
 
@@ -178,6 +210,10 @@ public class SSTableReader implements AutoCloseable, Iterable<DataRecord> {
         return closed;
     }
 
+    public boolean isObsolete() {
+        return obsolete;
+    }
+
     /**
      * Point lookup for a key:
      * 1. Min/Max key range check.
@@ -238,30 +274,41 @@ public class SSTableReader implements AutoCloseable, Iterable<DataRecord> {
 
     private class SSTableIterator implements Iterator<DataRecord> {
         private int currentBlockIndex = 0;
-        private Iterator<DataRecord> currentRecordIterator = null;
+        private Iterator<DataRecord> currentBlockIterator = null;
         private boolean iterClosed = false;
 
-        @Override
-        public boolean hasNext() {
-            if (iterClosed) return false;
-            while ((currentRecordIterator == null || !currentRecordIterator.hasNext())
+        public SSTableIterator() {
+            advanceToNextBlock();
+        }
+
+        private void advanceToNextBlock() {
+            while ((currentBlockIterator == null || !currentBlockIterator.hasNext())
                     && currentBlockIndex < indexBlock.size()) {
                 try {
                     IndexBlock.IndexEntry entry = indexBlock.getEntry(currentBlockIndex++);
                     ByteBuffer blockBuf = ByteBuffer.allocate(entry.getLength());
                     readFully(channel, blockBuf, entry.getOffset());
                     blockBuf.flip();
-                    DataBlock block = DataBlock.deserialize(blockBuf);
-                    currentRecordIterator = block.getRecords().iterator();
+
+                    DataBlock dataBlock = DataBlock.deserialize(blockBuf);
+                    currentBlockIterator = dataBlock.getRecords().iterator();
                 } catch (IOException e) {
-                    closeIterator();
-                    throw new RuntimeException("Failed to read SSTable block at index " + (currentBlockIndex - 1)
-                            + " in " + sstableFile.getName(), e);
+                    throw new RuntimeException("Failed reading block in SSTable " + sstableFile.getName(), e);
                 }
             }
-            boolean has = currentRecordIterator != null && currentRecordIterator.hasNext();
-            if (!has) {
-                closeIterator();
+
+            if ((currentBlockIterator == null || !currentBlockIterator.hasNext()) && !iterClosed) {
+                iterClosed = true;
+                releaseRef();
+            }
+        }
+
+        @Override
+        public boolean hasNext() {
+            boolean has = currentBlockIterator != null && currentBlockIterator.hasNext();
+            if (!has && !iterClosed) {
+                iterClosed = true;
+                releaseRef();
             }
             return has;
         }
@@ -269,17 +316,13 @@ public class SSTableReader implements AutoCloseable, Iterable<DataRecord> {
         @Override
         public DataRecord next() {
             if (!hasNext()) {
-                closeIterator();
                 throw new NoSuchElementException();
             }
-            return currentRecordIterator.next();
-        }
-
-        private void closeIterator() {
-            if (!iterClosed) {
-                iterClosed = true;
-                releaseRef();
+            DataRecord rec = currentBlockIterator.next();
+            if (!currentBlockIterator.hasNext()) {
+                advanceToNextBlock();
             }
+            return rec;
         }
     }
 

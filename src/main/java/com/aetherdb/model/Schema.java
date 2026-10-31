@@ -26,6 +26,7 @@ public class Schema {
 
     public String getTableName() { return tableName; }
     public List<ColumnDefinition> getColumns() { return columns; }
+    public List<ColumnDefinition> getColumnDefinitions() { return columns; }
     public int getColumnCount() { return columns.size(); }
 
     public ColumnDefinition getColumn(int index) {
@@ -35,6 +36,11 @@ public class Schema {
     public ColumnDefinition getColumn(String name) {
         Integer idx = columnIndexMap.get(name);
         return (idx != null) ? columns.get(idx) : null;
+    }
+
+    public ColumnType getColumnType(String name) {
+        ColumnDefinition col = getColumn(name);
+        return col != null ? col.getType() : null;
     }
 
     public int getColumnIndex(String name) {
@@ -58,7 +64,6 @@ public class Schema {
         for (ColumnDefinition col : columns) {
             BinaryUtils.writeString(buffer, col.getName());
             buffer.put(col.getType().getTypeId());
-            buffer.put((byte) (col.isNullable() ? 1 : 0));
         }
     }
 
@@ -72,14 +77,29 @@ public class Schema {
         for (int i = 0; i < colCount; i++) {
             String colName = BinaryUtils.readString(buffer);
             byte typeId = buffer.get();
-            boolean nullable = buffer.get() == 1;
-            cols.add(new ColumnDefinition(colName, ColumnType.fromTypeId(typeId), nullable));
+            cols.add(new ColumnDefinition(colName, ColumnType.fromTypeId(typeId)));
         }
         return new Schema(tableName, cols);
     }
 
     @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        Schema schema = (Schema) o;
+        return Objects.equals(tableName, schema.tableName) && Objects.equals(columns, schema.columns);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(tableName, columns);
+    }
+
+    @Override
     public String toString() {
-        return "Schema[" + tableName + ": " + columns + "]";
+        return "Schema{" +
+                "table='" + tableName + '\'' +
+                ", columns=" + columns +
+                '}';
     }
 }

@@ -2,11 +2,11 @@
 
 ## 1. Query Execution Pipeline
 
-AetherDB provides an in-memory columnar query execution engine supporting predicate pushdown, independent aggregation states, inclusive/exclusive boundaries, and GROUP BY operations.
+AetherDB provides an in-memory columnar query execution engine supporting predicate pushdown, independent aggregation states, inclusive/exclusive boundaries, 64-bit integer precision, and GROUP BY operations.
 
 ```mermaid
 flowchart TD
-    Req["QueryRequest (Table, Select, Predicates, GroupBy, Limit)"] --> Plan["Query Engine Planner"]
+    Req["QueryRequest (Table, Select, Predicates, GroupBy, Limit)"] --> Plan["Query Engine Planner & Validator"]
     Plan --> ZM["ZoneMap Evaluation (Min-Max Pruning per Chunk)"]
     ZM -->|Can Skip| Skip["Bypass Chunk (Zero I/O & Decompression)"]
     ZM -->|Must Scan| Scan["Vectorized Scanner"]
@@ -18,16 +18,27 @@ flowchart TD
 
 ---
 
-## 2. Independent Aggregate State Architecture
+## 2. Independent Aggregate State & Precision Architecture
 
 Every select expression maintains its own dedicated `AggregateAccumulator`:
 - **`COUNT(*)`**: Counts all matching rows in the selection bitset.
 - **`COUNT(column)`**: Counts only non-null values in the target column.
-- **`SUM(column)`**: Accumulates non-null numeric values.
-- **`AVG(column)`**: Accumulates non-null values and divides by the non-null count for that specific column.
+- **`SUM(column)`**:
+  - Accumulates non-null integer types (`INT32`, `INT64`, `TIMESTAMP`) as 64-bit `Long` values using `aggregateSumLong()` and `Math.addExact()`.
+  - Preserves exact 64-bit precision without double-precision rounding or precision loss.
+  - Switches to double precision floating-point accumulator only upon integer overflow.
+  - Floating-point columns (`FLOAT64`) accumulate directly as `Double`.
+- **`AVG(column)`**: Accumulates non-null values and divides strictly by the non-null count for that column.
 - **`MIN(column)`** / **`MAX(column)`**: Tracks the minimum and maximum non-null values for that column.
 
-Multiple aggregates in a single query (e.g. `SELECT COUNT(*), SUM(sales), AVG(latency)`) never share or corrupt each other's accumulation state.
+### SQL-Standard Empty Results
+When querying empty tables, non-existent tables, or queries where no rows match the filter predicates:
+- `COUNT(*)` = `0L`
+- `COUNT(column)` = `0L`
+- `SUM(column)` = `null`
+- `AVG(column)` = `null`
+- `MIN(column)` = `null`
+- `MAX(column)` = `null`
 
 ---
 
@@ -45,11 +56,10 @@ Multiple aggregates in a single query (e.g. `SELECT COUNT(*), SUM(sales), AVG(la
 
 ---
 
-## 4. GROUP BY Operations
+## 4. GROUP BY & Query Validation
 
 When `groupByColumns` are specified in `QueryRequest`:
-1. Each selected row in a chunk is mapped to a `List<Object>` group key.
-2. Group keys are mapped in a `LinkedHashMap<GroupKey, List<AggregateAccumulator>>`.
-3. Aggregate expressions accumulate independently within each group bucket.
+1. **Strict Expression Validation**: Every expression in the `SELECT` list must either be an aggregate function (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) or be explicitly listed in the `GROUP BY` clause. Non-aggregate standalone columns not in the `GROUP BY` list are strictly rejected with an informative error.
+2. **Schema Column Verification**: All columns specified in expressions, group-by clauses, and filter predicates are verified against the table schema.
+3. **Partitioned Bucketing**: Selected rows are grouped into `LinkedHashMap<GroupKey, List<AggregateAccumulator>>`.
 4. Output rows contain `[groupByColumns..., selectExpressions...]`.
-

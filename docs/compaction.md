@@ -17,21 +17,24 @@ AetherDB replaces full in-memory record materialization with a **streaming k-way
 
 ---
 
-## 2. Safe Tombstone Pruning
+## 2. Safe Tombstone Pruning (Resurrection Prevention)
 
-Tombstones (`RecordType.DELETE`) are only discarded during compaction when `isDeepestLevel == true` (i.e. all existing SSTables in the database participated in the compaction). If any older unconsidered SSTable exists, tombstones are preserved to prevent older deleted keys from resurrecting.
+Tombstones (`RecordType.DELETE`) are only discarded during compaction when both of the following conditions are strictly met:
+1. **Full SSTable Participation**: All currently installed SSTables in the storage engine participate in the compaction (`isFullCompaction == true`).
+2. **No In-Flight MemTable Flushes**: Neither the active MemTable nor any immutable MemTables waiting or actively flushing in the background have pending records (`hasPendingFlushes() == false`).
+
+If any older uncompacted SSTable or any unflushed immutable MemTable exists, tombstones are preserved. This prevents in-flight PUT operations from older MemTables from surfacing after compaction removes the tombstone intended to shadow them.
 
 ---
 
-## 3. Concurrency & Reader Isolation
+## 3. Concurrency, Atomic Publication & Reader Isolation
 
-1. **Compaction Snapshot**: Compaction captures an immutable snapshot of SSTables to compact: `tablesToCompact = new ArrayList<>(sstables)`.
-2. **Safe Writing**: Compacted records are written to a temporary `.tmp` file and atomically renamed to the target SSTable name.
-3. **Atomic Publication**: Under `rwLock.writeLock()`, only the participating tables are removed:
+1. **Independent Build & Validation**: Compaction constructs and validates the replacement SSTable in complete isolation into temporary files (`.tmp`).
+2. **Atomic Publication Transaction**: Under `rwLock.writeLock()`, the manager installs the compacted SSTable and swaps out the participating inputs atomically:
    ```java
-   sstables.removeAll(tablesToCompact);
+   sstables.removeAll(participatingTables);
    sstables.add(compactedReader);
    ```
-   Any newly installed SSTables created by concurrent flushes during the compaction process are **never clobbered or lost**.
-4. **Reader Reference Counting**: Each `SSTableReader` maintains an atomic reference count. Obsolete compacted files remain open until all active point readers and iterators complete, preventing `FileChannel` closed exceptions.
-
+   Readers always see either the complete pre-compaction storage snapshot or the complete post-compaction storage snapshot. Concurrent flushes installed during compaction are never clobbered.
+3. **Deferred Reader Retirement**: Input SSTables are never marked obsolete or closed before the replacement is successfully published. If compaction fails at any stage prior to publication, all input SSTables remain intact, fully readable, and valid.
+4. **Reference-Counted Retirement**: After publication, retired `SSTableReader` instances are marked obsolete and closed only once all active concurrent readers release their references (`refCount.decrementAndGet() == 0`), preventing closed-channel exceptions.

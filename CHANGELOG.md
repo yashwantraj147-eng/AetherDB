@@ -4,6 +4,38 @@ All notable changes and architectural repairs in **AetherDB V2** are documented 
 
 ---
 
+## [2.0.1] - 2026-10-31
+
+### Storage Engine & Crash Safety (Priority 0)
+- **Compaction Publication Race Resolution**: Redesigned SSTable replacement as an atomic publication transaction under `rwLock.writeLock()`. Compacted tables are built and validated in complete isolation. Input SSTable readers are never prematurely marked obsolete or closed; retirement is deferred until after the new SSTable is safely installed and active reader references are released. Failed compaction leaves all input SSTables intact without state corruption.
+- **Tombstone Resurrection Prevention**: Hardened tombstone-pruning logic across the entire storage lifecycle. Pruning is permitted only when all installed SSTables participate in compaction *and* no immutable MemTables are queued or actively flushing (`hasPendingFlushes() == false`), preventing older in-flight PUT operations from resurrecting deleted records.
+- **WAL Corruption Classification & Safe Recovery**: Explicitly separated Case A (incomplete trailing frame header or payload at EOF, safely truncated to `lastValidOffset`) from Case B (complete frame payload with bad CRC32 checksum, throwing `CorruptedWalException` to halt recovery and prevent silent corruption).
+- **Streaming WAL Recovery**: Added streaming record consumer `recoverAllSegments(walDir, consumer)` and `recoverFile(file, ch, lock, consumer)` to process records sequentially without allocating all log entries in heap memory.
+- **Atomic WAL Rotation**: Pre-allocates and initializes the new segment file before updating `activeWalFile` or closing the prior log, preventing unrecoverable states if rotation fails.
+
+### Columnar Integrity & Schema Consistency (Priority 1)
+- **Strict Columnar Checksum & Footer Validation**: Added strict 8-byte CRC32 footer verification in `ColumnarChunk`. Rejects truncated footers (< 8 bytes), missing footers, or trailing garbage bytes (`buffer.remaining() != 8`). Enforced chunk file size limits and row count bounds.
+- **Table-Wide Schema Consistency**: Persisted stable schemas per table across ingestion batches. Introduced `ColumnValue.ofNull()` for untyped JSON nulls, preventing premature STRING inference. Ingestion validates all records against existing schema, rejecting unexpected columns and type mismatches while populating missing columns with typed nulls.
+- **Idempotent MemTable Flush Lifecycle**: Added explicit `MemTable.State` machine (`ACTIVE`, `SEALED`, `QUEUED`, `FLUSHING`, `INSTALLED`, `FAILED`) with atomic CAS state transitions. Prevents duplicate concurrent flush execution from background tasks or manual REST API triggers.
+
+### Query Engine Semantics & REST Security (Priority 2)
+- **64-bit Integer Precision in Aggregations**: Implemented `aggregateSumLong()` in `VectorizedScanner` and integer accumulator branching in `QueryEngine` for `INT32`, `INT64`, and `TIMESTAMP` columns. Preserves exact 64-bit precision without double-precision conversion or IEEE 754 rounding, falling back to double only on arithmetic overflow.
+- **SQL-Standard Empty Table & Filter Aggregates**: Queries over non-existent tables or zero-matching filter rows return SQL-compliant results (`COUNT(*) = 0`, `COUNT(col) = 0`, `SUM = null`, `AVG = null`, `MIN = null`, `MAX = null`).
+- **Strict GROUP BY & Query Validation**: Enforced strict SQL validation rejecting non-aggregate expressions not present in GROUP BY clauses. Validates all referenced columns and filter predicates against table schemas.
+- **REST API Authentication on External Interfaces**: Mandatory Bearer token authentication is enforced when binding to `0.0.0.0` or any non-loopback network interface, preventing unauthorized remote access. Rejects blank or empty tokens.
+- **Timing Attack Mitigation**: Implemented constant-time token comparison using `MessageDigest.isEqual()`.
+- **Raft Endpoint Isolation**: Returns HTTP 404 for distributed consensus routes (`/raft/*`) when `raft.enabled=false`.
+- **HTTP Payload & Syntax Hardening**: Returns HTTP 413 Payload Too Large when request body exceeds configured limit; returns HTTP 400 Bad Request with descriptive error details for malformed JSON payloads.
+- **CORS Origin Validation**: Validates incoming `Origin` headers against configured allowlist.
+- **SSTable File Integrity Validation**: Verifies 6-byte header magic (`0x41455448`) and version at offset 0; validates footer offsets to guarantee non-overlapping bounds (`6 <= index <= bloom <= footer <= fileSize`); closes file channels deterministically on exception.
+
+### Build Scripts, CI & Benchmarking (Priority 3 & 4)
+- **Windows Batch Script Error Propagation**: Replaced parenthesized `%ERRORLEVEL%` blocks with jump labels and `exit /b %ERRORLEVEL%` in `build.bat`, `test.bat`, and `run.bat`, correctly reporting Maven compilation and test failures.
+- **Multi-OS GitHub Actions CI Matrix**: Configured automated CI matrix running on both `ubuntu-latest` and `windows-latest` on Java 21, executing `call test.bat` on Windows.
+- **Empirical Benchmark Accuracy**: Hardened `AetherBenchmark.java` to track successful versus failed operations separately, calculate failure-aware IOPS, record latency percentiles only for successful requests, report failure totals, and exit with code 1 upon failure.
+- **Lifecycle & Shutdown Safety**: Rejects write operations once `HybridStorageManager` is closed; made `close()` idempotent.
+- **Expanded Automated Test Suite**: Expanded test suite to 44 automated JUnit 5 tests covering compaction publication, tombstone resurrection, WAL corruption cases, columnar integrity, schema consistency, query semantics, and REST security with 100% pass rate.
+
 ## [2.0.0] - 2026-10-31
 
 ### Storage Engine & WAL Reliability (Priority 0)

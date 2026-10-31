@@ -12,8 +12,8 @@ import java.util.*;
  * Merges multiple SSTables into a single target SSTable with:
  * 1. Constant memory footprint using streaming k-way merge.
  * 2. Preservation of highest sequence number for duplicate keys.
- * 3. Safe tombstone pruning only when no older level exists.
- * 4. Reader-safe retirement of compacted SSTables.
+ * 3. Safe tombstone pruning only when no older level or pending flush exists.
+ * 4. Safe independent SSTable creation without retiring inputs prematurely.
  */
 public class CompactionEngine {
 
@@ -41,6 +41,8 @@ public class CompactionEngine {
 
     /**
      * Compacts a list of input SSTables into a single target SSTable using streaming merge.
+     * Note: Input SSTables are NOT marked obsolete here. The caller (HybridStorageManager)
+     * is responsible for atomic publication and retiring old readers after publication.
      */
     public static SSTableReader compact(List<SSTableReader> inputTables,
                                         File targetSSTableFile,
@@ -63,16 +65,15 @@ public class CompactionEngine {
 
         // Write the compacted SSTable using streaming iterator
         SSTableWriter writer = new SSTableWriter(targetSSTableFile, newTableId, targetLevel, blockSize, bloomFpr);
-        writer.write(streamingMergeIterator, totalEstimatedRecords);
-
-        SSTableReader compactedReader = new SSTableReader(targetSSTableFile);
-
-        // Mark input SSTables as obsolete; they will be closed and removed once existing readers finish
-        for (SSTableReader r : inputTables) {
-            r.markObsolete();
+        try {
+            writer.write(streamingMergeIterator, totalEstimatedRecords);
+            return new SSTableReader(targetSSTableFile);
+        } catch (Throwable t) {
+            if (targetSSTableFile.exists()) {
+                targetSSTableFile.delete();
+            }
+            throw (t instanceof IOException) ? (IOException) t : new IOException("Compaction failed: " + t.getMessage(), t);
         }
-
-        return compactedReader;
     }
 
     private static class StreamingMergeIterator implements Iterator<DataRecord> {
@@ -107,7 +108,7 @@ public class CompactionEngine {
                     continue;
                 }
 
-                // Tombstone handling: if it's the deepest level, discard deleted records
+                // Tombstone handling: if it's the deepest level and no older version can exist, discard deleted records
                 if (currentRecord.isTombstone() && isDeepestLevel) {
                     lastEmittedKey = currentRecord.getKey();
                     continue;

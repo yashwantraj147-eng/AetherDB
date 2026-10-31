@@ -1,14 +1,16 @@
 package com.aetherdb.storage.columnar;
 
+import com.aetherdb.model.ColumnType;
 import com.aetherdb.model.ColumnValue;
 
-import java.util.*;
+import java.util.BitSet;
+import java.util.List;
 import java.util.regex.Pattern;
 
 /**
- * High-throughput vectorized execution scanner for columnar chunks.
- * Evaluates filter predicates using selection bitsets and executes vectorized aggregations
- * with proper null and boundary handling.
+ * High-speed vectorized scanner operating on compressed ColumnarChunks in block batches.
+ * Evaluates filter predicates using SIMD-style BitSet masks and computes aggregations
+ * with zero intermediate allocations.
  */
 public class VectorizedScanner {
 
@@ -17,28 +19,27 @@ public class VectorizedScanner {
 
     public VectorizedScanner(ColumnarChunk chunk, int batchSize) {
         this.chunk = chunk;
-        this.batchSize = Math.max(64, batchSize);
-    }
-
-    public int getBatchSize() {
-        return batchSize;
+        this.batchSize = batchSize;
     }
 
     public ColumnarChunk getChunk() {
         return chunk;
     }
 
+    public boolean isIntegerColumn(String columnName) {
+        ColumnType type = chunk.getSchema().getColumnType(columnName);
+        return type == ColumnType.INT32 || type == ColumnType.INT64 || type == ColumnType.TIMESTAMP;
+    }
+
     /**
-     * Evaluates an equality filter over a column vector.
+     * Vectorized filter: col == targetValue
      */
     public BitSet filterEquals(String columnName, ColumnValue target) {
         List<ColumnValue> column = chunk.getDecodedColumn(columnName);
         BitSet selection = new BitSet(column.size());
-        int size = column.size();
-
-        for (int i = 0; i < size; i++) {
+        for (int i = 0; i < column.size(); i++) {
             ColumnValue val = column.get(i);
-            if (Objects.equals(val, target)) {
+            if (val != null && val.compareTo(target) == 0) {
                 selection.set(i);
             }
         }
@@ -46,17 +47,14 @@ public class VectorizedScanner {
     }
 
     /**
-     * Evaluates a not-equals filter over a column vector.
-     * In standard SQL semantics, NULL values evaluate to UNKNOWN and are excluded.
+     * Vectorized filter: col != targetValue
      */
     public BitSet filterNotEquals(String columnName, ColumnValue target) {
         List<ColumnValue> column = chunk.getDecodedColumn(columnName);
         BitSet selection = new BitSet(column.size());
-        int size = column.size();
-
-        for (int i = 0; i < size; i++) {
+        for (int i = 0; i < column.size(); i++) {
             ColumnValue val = column.get(i);
-            if (val != null && !val.isNull() && !Objects.equals(val, target)) {
+            if (val != null && val.compareTo(target) != 0) {
                 selection.set(i);
             }
         }
@@ -64,16 +62,14 @@ public class VectorizedScanner {
     }
 
     /**
-     * Evaluates a strict greater-than filter (> target).
+     * Vectorized filter: col > targetValue
      */
     public BitSet filterGreaterThan(String columnName, ColumnValue target) {
         List<ColumnValue> column = chunk.getDecodedColumn(columnName);
         BitSet selection = new BitSet(column.size());
-        int size = column.size();
-
-        for (int i = 0; i < size; i++) {
+        for (int i = 0; i < column.size(); i++) {
             ColumnValue val = column.get(i);
-            if (val != null && !val.isNull() && val.compareTo(target) > 0) {
+            if (val != null && val.compareTo(target) > 0) {
                 selection.set(i);
             }
         }
@@ -81,16 +77,14 @@ public class VectorizedScanner {
     }
 
     /**
-     * Evaluates an inclusive greater-than-or-equals filter (>= target).
+     * Vectorized filter: col >= targetValue
      */
     public BitSet filterGreaterThanOrEquals(String columnName, ColumnValue target) {
         List<ColumnValue> column = chunk.getDecodedColumn(columnName);
         BitSet selection = new BitSet(column.size());
-        int size = column.size();
-
-        for (int i = 0; i < size; i++) {
+        for (int i = 0; i < column.size(); i++) {
             ColumnValue val = column.get(i);
-            if (val != null && !val.isNull() && val.compareTo(target) >= 0) {
+            if (val != null && val.compareTo(target) >= 0) {
                 selection.set(i);
             }
         }
@@ -98,16 +92,14 @@ public class VectorizedScanner {
     }
 
     /**
-     * Evaluates a strict less-than filter (< target).
+     * Vectorized filter: col < targetValue
      */
     public BitSet filterLessThan(String columnName, ColumnValue target) {
         List<ColumnValue> column = chunk.getDecodedColumn(columnName);
         BitSet selection = new BitSet(column.size());
-        int size = column.size();
-
-        for (int i = 0; i < size; i++) {
+        for (int i = 0; i < column.size(); i++) {
             ColumnValue val = column.get(i);
-            if (val != null && !val.isNull() && val.compareTo(target) < 0) {
+            if (val != null && val.compareTo(target) < 0) {
                 selection.set(i);
             }
         }
@@ -115,16 +107,14 @@ public class VectorizedScanner {
     }
 
     /**
-     * Evaluates an inclusive less-than-or-equals filter (<= target).
+     * Vectorized filter: col <= targetValue
      */
     public BitSet filterLessThanOrEquals(String columnName, ColumnValue target) {
         List<ColumnValue> column = chunk.getDecodedColumn(columnName);
         BitSet selection = new BitSet(column.size());
-        int size = column.size();
-
-        for (int i = 0; i < size; i++) {
+        for (int i = 0; i < column.size(); i++) {
             ColumnValue val = column.get(i);
-            if (val != null && !val.isNull() && val.compareTo(target) <= 0) {
+            if (val != null && val.compareTo(target) <= 0) {
                 selection.set(i);
             }
         }
@@ -132,7 +122,7 @@ public class VectorizedScanner {
     }
 
     /**
-     * Evaluates a SQL LIKE pattern (supporting % and _ wildcards).
+     * Vectorized LIKE pattern matching (SQL % and _ support).
      */
     public BitSet filterLike(String columnName, String likePattern) {
         List<ColumnValue> column = chunk.getDecodedColumn(columnName);
@@ -142,10 +132,9 @@ public class VectorizedScanner {
         String regex = "^" + Pattern.quote(likePattern)
                 .replace("%", "\\E.*\\Q")
                 .replace("_", "\\E.\\Q") + "$";
-        Pattern pattern = Pattern.compile(regex, Pattern.CASE_INSENSITIVE);
+        Pattern pattern = Pattern.compile(regex);
 
-        int size = column.size();
-        for (int i = 0; i < size; i++) {
+        for (int i = 0; i < column.size(); i++) {
             ColumnValue val = column.get(i);
             if (val != null && !val.isNull() && val.asString() != null) {
                 if (pattern.matcher(val.asString()).matches()) {
@@ -157,7 +146,7 @@ public class VectorizedScanner {
     }
 
     /**
-     * Vectorized SUM aggregation over selected rows.
+     * Vectorized SUM aggregation over selected rows (floating point).
      */
     public double aggregateSum(String columnName, BitSet selection) {
         List<ColumnValue> column = chunk.getDecodedColumn(columnName);
@@ -179,6 +168,28 @@ public class VectorizedScanner {
     }
 
     /**
+     * Vectorized SUM aggregation preserving 64-bit integer precision.
+     */
+    public long aggregateSumLong(String columnName, BitSet selection) {
+        List<ColumnValue> column = chunk.getDecodedColumn(columnName);
+        long sum = 0;
+        int size = column.size();
+
+        if (selection == null) {
+            for (int i = 0; i < size; i++) {
+                ColumnValue val = column.get(i);
+                if (val != null && !val.isNull()) sum += val.asLong();
+            }
+        } else {
+            for (int i = selection.nextSetBit(0); i >= 0 && i < size; i = selection.nextSetBit(i + 1)) {
+                ColumnValue val = column.get(i);
+                if (val != null && !val.isNull()) sum += val.asLong();
+            }
+        }
+        return sum;
+    }
+
+    /**
      * Vectorized COUNT(*) aggregation over selected rows.
      */
     public long aggregateCount(BitSet selection) {
@@ -189,7 +200,7 @@ public class VectorizedScanner {
     }
 
     /**
-     * Vectorized COUNT(column) aggregation that counts only non-null values.
+     * Vectorized non-null COUNT aggregation over selected rows.
      */
     public long aggregateCountNonNull(String columnName, BitSet selection) {
         List<ColumnValue> column = chunk.getDecodedColumn(columnName);
@@ -221,15 +232,15 @@ public class VectorizedScanner {
         if (selection == null) {
             for (int i = 0; i < size; i++) {
                 ColumnValue val = column.get(i);
-                if (val != null && !val.isNull() && (min == null || val.compareTo(min) < 0)) {
-                    min = val;
+                if (val != null && !val.isNull()) {
+                    if (min == null || val.compareTo(min) < 0) min = val;
                 }
             }
         } else {
             for (int i = selection.nextSetBit(0); i >= 0 && i < size; i = selection.nextSetBit(i + 1)) {
                 ColumnValue val = column.get(i);
-                if (val != null && !val.isNull() && (min == null || val.compareTo(min) < 0)) {
-                    min = val;
+                if (val != null && !val.isNull()) {
+                    if (min == null || val.compareTo(min) < 0) min = val;
                 }
             }
         }
@@ -247,15 +258,15 @@ public class VectorizedScanner {
         if (selection == null) {
             for (int i = 0; i < size; i++) {
                 ColumnValue val = column.get(i);
-                if (val != null && !val.isNull() && (max == null || val.compareTo(max) > 0)) {
-                    max = val;
+                if (val != null && !val.isNull()) {
+                    if (max == null || val.compareTo(max) > 0) max = val;
                 }
             }
         } else {
             for (int i = selection.nextSetBit(0); i >= 0 && i < size; i = selection.nextSetBit(i + 1)) {
                 ColumnValue val = column.get(i);
-                if (val != null && !val.isNull() && (max == null || val.compareTo(max) > 0)) {
-                    max = val;
+                if (val != null && !val.isNull()) {
+                    if (max == null || val.compareTo(max) > 0) max = val;
                 }
             }
         }

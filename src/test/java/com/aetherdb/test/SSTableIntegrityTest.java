@@ -68,6 +68,42 @@ public class SSTableIntegrityTest {
     }
 
     @Test
+    @DisplayName("Header validation: invalid 6-byte header magic throws CorruptedSSTableException")
+    void testHeaderMagicValidation() throws Exception {
+        File sstFile = new File(tempDir.toFile(), "sstable_badmagic.sst");
+        SSTableWriter writer = new SSTableWriter(sstFile, 10, 0, 4096, 0.01);
+        writer.write(List.of(DataRecord.put("k", "v", 1)).iterator(), 1);
+
+        // Corrupt magic bytes at offset 0
+        try (RandomAccessFile raf = new RandomAccessFile(sstFile, "rw")) {
+            raf.seek(0);
+            raf.writeInt(0xBAD0CAFE);
+        }
+
+        assertThrows(CorruptedSSTableException.class, () -> {
+            new SSTableReader(sstFile);
+        });
+    }
+
+    @Test
+    @DisplayName("Header validation: unsupported header version throws CorruptedSSTableException")
+    void testHeaderVersionValidation() throws Exception {
+        File sstFile = new File(tempDir.toFile(), "sstable_badversion.sst");
+        SSTableWriter writer = new SSTableWriter(sstFile, 11, 0, 4096, 0.01);
+        writer.write(List.of(DataRecord.put("k", "v", 1)).iterator(), 1);
+
+        // Corrupt version at offset 4
+        try (RandomAccessFile raf = new RandomAccessFile(sstFile, "rw")) {
+            raf.seek(4);
+            raf.writeShort((short) 999);
+        }
+
+        assertThrows(CorruptedSSTableException.class, () -> {
+            new SSTableReader(sstFile);
+        });
+    }
+
+    @Test
     @DisplayName("CRC verification: corrupted data block throws CorruptedSSTableException")
     void testCorruptedDataBlockCrcFails() throws Exception {
         File sstFile = new File(tempDir.toFile(), "sstable_000002.sst");
@@ -103,9 +139,7 @@ public class SSTableIntegrityTest {
         }
 
         assertTrue(tempFile.exists());
-        // Verify genuine sstable readers only look at completed .sst files
         File[] sstables = tempDir.toFile().listFiles((dir, name) -> name.endsWith(Constants.SSTABLE_DATA_EXT));
         assertEquals(0, sstables != null ? sstables.length : 0);
     }
 }
-

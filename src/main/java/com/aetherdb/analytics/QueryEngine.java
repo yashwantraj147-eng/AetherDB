@@ -1,6 +1,6 @@
 package com.aetherdb.analytics;
 
-import com.aetherdb.model.ColumnValue;
+import com.aetherdb.model.*;
 import com.aetherdb.storage.columnar.ColumnarChunk;
 import com.aetherdb.storage.columnar.VectorizedScanner;
 import com.aetherdb.storage.columnar.ZoneMap;
@@ -9,12 +9,12 @@ import com.aetherdb.storage.engine.StorageEngine;
 import java.util.*;
 
 /**
- * Analytical Query Planner & Execution Engine.
- * Implements:
- * 1. Predicate pushdown with ZoneMap data skipping (bypassing unneeded chunks).
- * 2. Vectorized column evaluations and batch aggregations with independent aggregate state per expression.
- * 3. Robust GROUP BY support with group-specific aggregation state.
- * 4. Correct inclusive boundary filtering and null semantics.
+ * High-performance Vectorized SQL-like Query Execution Engine.
+ * Features:
+ * 1. SIMD-style BitSet predicate evaluation with ZoneMap chunk skipping.
+ * 2. Vectorized aggregation accumulators preserving 64-bit integer precision.
+ * 3. SQL-standard semantics for empty tables and filters (COUNT(*) returns 0, SUM/AVG return null).
+ * 4. Strict GROUP BY validation rejecting invalid non-aggregate projections.
  */
 public class QueryEngine {
 
@@ -28,16 +28,12 @@ public class QueryEngine {
 
     public QueryResult execute(QueryRequest request) {
         long startNanos = System.nanoTime();
-        List<ColumnarChunk> chunks = storageEngine.getColumnarChunks(request.getTableName());
-
-        if (chunks.isEmpty()) {
-            List<String> outputCols = new ArrayList<>();
-            if (request.getGroupByColumns() != null) {
-                outputCols.addAll(request.getGroupByColumns());
-            }
-            outputCols.addAll(request.getSelectExpressions());
-            return new QueryResult(outputCols, Collections.emptyList(), 0.0, 0, 0, 0);
+        if (request == null) {
+            throw new IllegalArgumentException("QueryRequest cannot be null");
         }
+
+        List<ColumnarChunk> chunks = storageEngine.getColumnarChunks(request.getTableName());
+        validateQuery(request, chunks);
 
         boolean hasGroupBy = request.getGroupByColumns() != null && !request.getGroupByColumns().isEmpty();
         boolean isAggregateQuery = hasGroupBy;
@@ -45,11 +41,30 @@ public class QueryEngine {
         if (!isAggregateQuery) {
             for (String expr : request.getSelectExpressions()) {
                 String upper = expr.toUpperCase().trim();
-                if (upper.startsWith("COUNT") || upper.startsWith("SUM") || upper.startsWith("AVG")
-                        || upper.startsWith("MIN") || upper.startsWith("MAX")) {
+                if (isAggregateExpression(upper)) {
                     isAggregateQuery = true;
                     break;
                 }
+            }
+        }
+
+        if (chunks.isEmpty()) {
+            List<String> outputCols = new ArrayList<>();
+            if (hasGroupBy) {
+                outputCols.addAll(request.getGroupByColumns());
+                outputCols.addAll(request.getSelectExpressions());
+                return new QueryResult(outputCols, Collections.emptyList(), 0.0, 0, 0, 0);
+            } else if (isAggregateQuery) {
+                outputCols.addAll(request.getSelectExpressions());
+                List<Object> row = new ArrayList<>();
+                for (String expr : request.getSelectExpressions()) {
+                    AggregateAccumulator acc = createAccumulator(expr);
+                    row.add(acc.getResult());
+                }
+                return new QueryResult(outputCols, List.of(row), 0.0, 0, 0, 0);
+            } else {
+                outputCols.addAll(request.getSelectExpressions());
+                return new QueryResult(outputCols, Collections.emptyList(), 0.0, 0, 0, 0);
             }
         }
 
@@ -58,6 +73,82 @@ public class QueryEngine {
         } else {
             return executeProjectQuery(request, chunks, startNanos);
         }
+    }
+
+    private void validateQuery(QueryRequest request, List<ColumnarChunk> chunks) {
+        if (request.getTableName() == null || request.getTableName().trim().isEmpty()) {
+            throw new IllegalArgumentException("Table name cannot be empty");
+        }
+        if (request.getLimit() <= 0) {
+            throw new IllegalArgumentException("Query limit must be positive, got: " + request.getLimit());
+        }
+        if (request.getSelectExpressions() == null || request.getSelectExpressions().isEmpty()) {
+            throw new IllegalArgumentException("SELECT expressions cannot be empty");
+        }
+
+        List<String> groupByCols = request.getGroupByColumns() != null ? request.getGroupByColumns() : Collections.emptyList();
+        Set<String> groupBySet = new HashSet<>(groupByCols);
+
+        // Validate each select expression
+        for (String expr : request.getSelectExpressions()) {
+            String upper = expr.toUpperCase().trim();
+            boolean isAgg = isAggregateExpression(upper);
+            if (!isAgg) {
+                if (!groupByCols.isEmpty() && !groupBySet.contains(expr)) {
+                    throw new IllegalArgumentException("Expression '" + expr + "' must appear in the GROUP BY clause or be used in an aggregate function");
+                }
+            } else {
+                if (!isValidAggregateSyntax(upper)) {
+                    throw new IllegalArgumentException("Malformed or unsupported aggregate expression: " + expr);
+                }
+            }
+        }
+
+        // Validate columns against schema if chunks exist
+        if (!chunks.isEmpty()) {
+            Schema schema = chunks.get(0).getSchema();
+            Set<String> schemaCols = new HashSet<>();
+            for (ColumnDefinition cd : schema.getColumnDefinitions()) {
+                schemaCols.add(cd.getName());
+            }
+
+            for (String gCol : groupByCols) {
+                if (!schemaCols.contains(gCol)) {
+                    throw new IllegalArgumentException("Unknown column in GROUP BY: '" + gCol + "'");
+                }
+            }
+
+            for (String expr : request.getSelectExpressions()) {
+                if (isAggregateExpression(expr.toUpperCase().trim())) {
+                    String col = extractColumnName(expr);
+                    if (!"*".equals(col) && !col.isEmpty() && !schemaCols.contains(col)) {
+                        throw new IllegalArgumentException("Unknown column in aggregate expression '" + expr + "': '" + col + "'");
+                    }
+                } else {
+                    if (!schemaCols.contains(expr)) {
+                        throw new IllegalArgumentException("Unknown column in SELECT expression: '" + expr + "'");
+                    }
+                }
+            }
+
+            if (request.getPredicates() != null) {
+                for (Predicate pred : request.getPredicates()) {
+                    if (!schemaCols.contains(pred.getColumnName())) {
+                        throw new IllegalArgumentException("Unknown column in predicate: '" + pred.getColumnName() + "'");
+                    }
+                }
+            }
+        }
+    }
+
+    private static boolean isAggregateExpression(String upper) {
+        return upper.startsWith("COUNT(") || upper.startsWith("SUM(") || upper.startsWith("AVG(")
+                || upper.startsWith("MIN(") || upper.startsWith("MAX(");
+    }
+
+    private static boolean isValidAggregateSyntax(String upper) {
+        return (upper.startsWith("COUNT(") || upper.startsWith("SUM(") || upper.startsWith("AVG(")
+                || upper.startsWith("MIN(") || upper.startsWith("MAX(")) && upper.endsWith(")");
     }
 
     private interface AggregateAccumulator {
@@ -84,17 +175,53 @@ public class QueryEngine {
     }
 
     private static class SumAccumulator implements AggregateAccumulator {
-        private double sum = 0.0;
+        private long integerSum = 0;
+        private double doubleSum = 0.0;
+        private boolean isIntegerOnly = true;
         private boolean hasValue = false;
+
+        public void addLong(long val) {
+            hasValue = true;
+            if (isIntegerOnly) {
+                try {
+                    integerSum = Math.addExact(integerSum, val);
+                } catch (ArithmeticException overflow) {
+                    isIntegerOnly = false;
+                    doubleSum = (double) integerSum + (double) val;
+                }
+            } else {
+                doubleSum += val;
+            }
+        }
+
+        public void addDouble(double val) {
+            hasValue = true;
+            if (isIntegerOnly) {
+                doubleSum = (double) integerSum;
+                isIntegerOnly = false;
+            }
+            doubleSum += val;
+        }
+
         @Override
         public void accumulate(ColumnValue val) {
             if (val != null && !val.isNull()) {
-                sum += val.asDouble();
-                hasValue = true;
+                if (isIntegerOnly && (val.getType() == ColumnType.INT32 || val.getType() == ColumnType.INT64 || val.getType() == ColumnType.TIMESTAMP)) {
+                    addLong(val.asLong());
+                } else {
+                    addDouble(val.asDouble());
+                }
             }
         }
+
         @Override
-        public Object getResult() { return hasValue ? sum : 0.0; }
+        public Object getResult() {
+            if (!hasValue) return null;
+            if (isIntegerOnly) {
+                return Long.valueOf(integerSum);
+            }
+            return Double.valueOf(doubleSum);
+        }
     }
 
     private static class AvgAccumulator implements AggregateAccumulator {
@@ -108,7 +235,7 @@ public class QueryEngine {
             }
         }
         @Override
-        public Object getResult() { return count > 0 ? (sum / count) : 0.0; }
+        public Object getResult() { return count > 0 ? (sum / count) : null; }
     }
 
     private static class MinAccumulator implements AggregateAccumulator {
@@ -122,7 +249,7 @@ public class QueryEngine {
             }
         }
         @Override
-        public Object getResult() { return min != null ? min.getValue() : "NULL"; }
+        public Object getResult() { return min != null ? min.getValue() : null; }
     }
 
     private static class MaxAccumulator implements AggregateAccumulator {
@@ -136,7 +263,7 @@ public class QueryEngine {
             }
         }
         @Override
-        public Object getResult() { return max != null ? max.getValue() : "NULL"; }
+        public Object getResult() { return max != null ? max.getValue() : null; }
     }
 
     private AggregateAccumulator createAccumulator(String expr) {
@@ -157,11 +284,13 @@ public class QueryEngine {
         } else if (upper.startsWith("MAX")) {
             return new MaxAccumulator();
         }
-        // Fallback for non-aggregate expression in group-by query
-        return new MaxAccumulator();
+        throw new IllegalArgumentException("Unsupported aggregate expression: " + expr);
     }
 
     private BitSet evaluatePredicates(VectorizedScanner scanner, List<Predicate> predicates) {
+        if (predicates == null || predicates.isEmpty()) {
+            return null;
+        }
         BitSet selection = null;
         for (Predicate pred : predicates) {
             BitSet filterBitSet = switch (pred.getOperator()) {
@@ -208,11 +337,13 @@ public class QueryEngine {
         for (ColumnarChunk chunk : chunks) {
             // Predicate pushdown check using Zone Maps
             boolean canSkip = false;
-            for (Predicate pred : request.getPredicates()) {
-                ZoneMap zm = chunk.getZoneMap(pred.getColumnName());
-                if (pred.canSkipChunk(zm)) {
-                    canSkip = true;
-                    break;
+            if (request.getPredicates() != null) {
+                for (Predicate pred : request.getPredicates()) {
+                    ZoneMap zm = chunk.getZoneMap(pred.getColumnName());
+                    if (pred.canSkipChunk(zm)) {
+                        canSkip = true;
+                        break;
+                    }
                 }
             }
 
@@ -238,8 +369,11 @@ public class QueryEngine {
                     } else if (acc instanceof CountColumnAccumulator cca) {
                         cca.count += scanner.aggregateCountNonNull(col, selection);
                     } else if (acc instanceof SumAccumulator sa) {
-                        sa.sum += scanner.aggregateSum(col, selection);
-                        sa.hasValue = true;
+                        if (scanner.isIntegerColumn(col)) {
+                            sa.addLong(scanner.aggregateSumLong(col, selection));
+                        } else {
+                            sa.addDouble(scanner.aggregateSum(col, selection));
+                        }
                     } else if (acc instanceof AvgAccumulator aa) {
                         aa.sum += scanner.aggregateSum(col, selection);
                         aa.count += scanner.aggregateCountNonNull(col, selection);
@@ -341,11 +475,13 @@ public class QueryEngine {
 
         for (ColumnarChunk chunk : chunks) {
             boolean canSkip = false;
-            for (Predicate pred : request.getPredicates()) {
-                ZoneMap zm = chunk.getZoneMap(pred.getColumnName());
-                if (pred.canSkipChunk(zm)) {
-                    canSkip = true;
-                    break;
+            if (request.getPredicates() != null) {
+                for (Predicate pred : request.getPredicates()) {
+                    ZoneMap zm = chunk.getZoneMap(pred.getColumnName());
+                    if (pred.canSkipChunk(zm)) {
+                        canSkip = true;
+                        break;
+                    }
                 }
             }
 

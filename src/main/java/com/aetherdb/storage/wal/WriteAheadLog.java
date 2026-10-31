@@ -4,18 +4,17 @@ import com.aetherdb.common.AetherConfig;
 import com.aetherdb.common.Constants;
 import com.aetherdb.model.DataRecord;
 
-import java.io.EOFException;
 import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
-import java.nio.file.Files;
 import java.nio.file.StandardOpenOption;
 import java.util.*;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.zip.CRC32;
@@ -29,6 +28,11 @@ import java.util.zip.CRC32;
  * - IMMEDIATE: Guarantees synchronous fsync (channel.force) on every append before acknowledging write.
  * - PERIODIC: Flushes to OS buffer on append and fsyncs periodically on background timer.
  * - OS_BUFFER: Buffers in OS page cache; durable on graceful OS flush.
+ *
+ * Recovery semantics:
+ * - Case A (Incomplete trailing frame): Demonstrably incomplete trailing header/payload at EOF is truncated and forced.
+ * - Case B (Complete frame with incorrect CRC): Throws CorruptedWalException. Never silently truncated.
+ * - Case C (Corruption inside WAL): Throws CorruptedWalException.
  */
 public class WriteAheadLog implements AutoCloseable {
 
@@ -155,8 +159,9 @@ public class WriteAheadLog implements AutoCloseable {
     }
 
     /**
-     * Rotates the WAL to a new monotonically identified segment.
-     * Flushes and syncs the current segment, closes it, and opens the next segment.
+     * Rotates the WAL to a new monotonically identified segment safely.
+     * Pre-allocates and initializes the new segment BEFORE closing the current one.
+     * If initialization fails, the active segment remains open and usable.
      * Returns the file of the rotated (now sealed) segment.
      */
     public File rotate(long nextSegmentId) throws IOException {
@@ -166,18 +171,42 @@ public class WriteAheadLog implements AutoCloseable {
                 throw new IllegalStateException("WAL is closed, cannot rotate");
             }
 
-            // Sync and close existing segment
+            // Pre-create and initialize the new segment BEFORE touching active segment
+            String nextFilename = formatSegmentFilename(nextSegmentId);
+            File nextWalFile = new File(walDir, nextFilename);
+            FileChannel nextChannel = FileChannel.open(
+                    nextWalFile.toPath(),
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.READ,
+                    StandardOpenOption.WRITE
+            );
+
+            try {
+                ByteBuffer header = ByteBuffer.allocate(6);
+                header.putInt(Constants.WAL_MAGIC);
+                header.putShort(Constants.WAL_VERSION);
+                header.flip();
+                writeFully(nextChannel, header);
+                nextChannel.force(true);
+            } catch (IOException e) {
+                try {
+                    nextChannel.close();
+                } catch (IOException ignored) {}
+                nextWalFile.delete();
+                throw new IOException("Failed to initialize new WAL segment: " + nextFilename, e);
+            }
+
+            // Flush and close previous active segment
             if (channel != null && channel.isOpen()) {
                 channel.force(true);
                 channel.close();
             }
 
             File rotatedFile = currentWalFile;
+            this.channel = nextChannel;
+            this.currentWalFile = nextWalFile;
             this.currentSegmentId = nextSegmentId;
-            String nextFilename = formatSegmentFilename(nextSegmentId);
-            this.currentWalFile = new File(walDir, nextFilename);
 
-            openCurrentFile();
             return rotatedFile;
         } finally {
             appendLock.unlock();
@@ -185,18 +214,29 @@ public class WriteAheadLog implements AutoCloseable {
     }
 
     /**
-     * Recovers records from the current WAL file with bounded streaming memory usage,
-     * header validation, CRC validation, and safe torn-tail truncation.
+     * Recovers records from the current WAL file with bounded streaming memory usage.
      */
     public List<DataRecord> recover() throws IOException {
-        return recoverFile(this.currentWalFile, this.channel, appendLock);
+        List<DataRecord> records = new ArrayList<>();
+        recoverFile(this.currentWalFile, this.channel, appendLock, records::add);
+        return records;
     }
 
     /**
-     * Recovers records from a specific WAL segment file.
+     * Recovers records from a specific WAL segment file into a list.
      */
     public static List<DataRecord> recoverFile(File file, FileChannel ch, ReentrantLock lock) throws IOException {
         List<DataRecord> records = new ArrayList<>();
+        recoverFile(file, ch, lock, records::add);
+        return records;
+    }
+
+    /**
+     * Recovers records from a specific WAL segment file via a streaming consumer.
+     * Distinguishes Case A (incomplete trailing frame), Case B (complete frame with bad CRC),
+     * and Case C (corruption inside WAL).
+     */
+    public static void recoverFile(File file, FileChannel ch, ReentrantLock lock, Consumer<DataRecord> consumer) throws IOException {
         boolean managedChannel = (ch == null);
         FileChannel targetChannel = managedChannel
                 ? FileChannel.open(file.toPath(), StandardOpenOption.READ, StandardOpenOption.WRITE)
@@ -207,11 +247,11 @@ public class WriteAheadLog implements AutoCloseable {
             long fileSize = targetChannel.size();
             if (fileSize < 6) {
                 if (fileSize > 0) {
-                    // Incomplete header at EOF, truncate
+                    // Case A: Incomplete magic/version header at EOF
                     targetChannel.truncate(0);
                     targetChannel.force(true);
                 }
-                return records;
+                return;
             }
 
             targetChannel.position(0);
@@ -219,7 +259,7 @@ public class WriteAheadLog implements AutoCloseable {
             if (readFully(targetChannel, header) < 6) {
                 targetChannel.truncate(0);
                 targetChannel.force(true);
-                return records;
+                return;
             }
             header.flip();
 
@@ -244,7 +284,7 @@ public class WriteAheadLog implements AutoCloseable {
                     break;
                 }
                 if (headerRead < 8) {
-                    // Incomplete frame header at EOF (torn tail)
+                    // Case A: Incomplete frame header at EOF (torn tail)
                     break;
                 }
                 frameHeaderBuf.flip();
@@ -252,7 +292,7 @@ public class WriteAheadLog implements AutoCloseable {
                 int payloadLen = frameHeaderBuf.getInt();
 
                 if (payloadLen <= 0 || payloadLen > LogEntry.MAX_PAYLOAD_SIZE) {
-                    // Corrupted length. If at or near EOF, consider torn tail
+                    // If header is at the very EOF
                     if (lastValidOffset + 8 >= fileSize) {
                         break;
                     }
@@ -260,14 +300,14 @@ public class WriteAheadLog implements AutoCloseable {
                 }
 
                 if (lastValidOffset + 8 + payloadLen > fileSize) {
-                    // Incomplete payload at EOF (torn tail)
+                    // Case A: Incomplete payload at EOF (torn tail)
                     break;
                 }
 
                 ByteBuffer payloadBuf = ByteBuffer.allocate(payloadLen);
                 int payloadRead = readFully(targetChannel, payloadBuf);
                 if (payloadRead < payloadLen) {
-                    // Incomplete payload at EOF
+                    // Case A: Incomplete payload at EOF
                     break;
                 }
                 payloadBuf.flip();
@@ -277,26 +317,23 @@ public class WriteAheadLog implements AutoCloseable {
                 long actualCrc = crc.getValue();
 
                 if ((int) actualCrc != expectedCrc) {
-                    if (lastValidOffset + 8 + payloadLen >= fileSize) {
-                        // Torn tail write at EOF
-                        break;
-                    }
+                    // Case B: Complete frame present on disk but checksum mismatch!
+                    // This is actual corruption, NOT a torn write. Fail recovery.
                     throw new CorruptedWalException("WAL CRC32 mismatch at offset " + lastValidOffset + " in " + file.getName()
                             + "! Expected=" + expectedCrc + ", Actual=" + (int) actualCrc);
                 }
 
                 DataRecord record = DataRecord.deserialize(payloadBuf);
-                records.add(record);
+                consumer.accept(record);
                 lastValidOffset = targetChannel.position();
             }
 
-            // Truncate incomplete trailing bytes if any
+            // Case A: Truncate demonstrably incomplete trailing bytes if any
             if (targetChannel.size() > lastValidOffset) {
                 targetChannel.truncate(lastValidOffset);
                 targetChannel.force(true);
             }
             targetChannel.position(lastValidOffset);
-            return records;
         } finally {
             if (managedChannel) {
                 targetChannel.close();
@@ -310,20 +347,25 @@ public class WriteAheadLog implements AutoCloseable {
      */
     public static List<DataRecord> recoverAllSegments(File walDir) throws IOException {
         List<DataRecord> allRecords = new ArrayList<>();
+        recoverAllSegments(walDir, allRecords::add);
+        return allRecords;
+    }
+
+    /**
+     * Recovers records across all valid WAL segments in the WAL directory using streaming callback.
+     */
+    public static void recoverAllSegments(File walDir, Consumer<DataRecord> consumer) throws IOException {
         File[] walFiles = walDir.listFiles((dir, name) -> name.endsWith(Constants.WAL_FILE_EXT));
         if (walFiles == null || walFiles.length == 0) {
-            return allRecords;
+            return;
         }
 
         // Sort files chronologically by segment sequence id
         Arrays.sort(walFiles, Comparator.comparingLong(f -> parseSegmentId(f.getName())));
 
         for (File f : walFiles) {
-            List<DataRecord> segmentRecords = recoverFile(f, null, null);
-            allRecords.addAll(segmentRecords);
+            recoverFile(f, null, null, consumer);
         }
-
-        return allRecords;
     }
 
     public static String formatSegmentFilename(long segmentId) {

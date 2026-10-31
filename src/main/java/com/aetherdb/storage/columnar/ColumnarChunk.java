@@ -2,7 +2,7 @@ package com.aetherdb.storage.columnar;
 
 import com.aetherdb.common.BinaryUtils;
 import com.aetherdb.common.Constants;
-import com.aetherdb.model.ColumnDefinition;
+import com.aetherdb.model.ColumnType;
 import com.aetherdb.model.ColumnValue;
 import com.aetherdb.model.Schema;
 
@@ -15,62 +15,80 @@ import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.zip.CRC32;
 
 /**
- * On-disk and in-memory columnar chunk container for high-throughput OLAP analytics.
- * Holds encoded columnar blocks, block-level Min-Max Zone Maps, and table schema.
- * Implements CRC32 checksum verification and atomic installation on write.
+ * Immutable on-disk and in-memory representation of a columnar chunk.
+ * Stores compressed columns (RLE/Dictionary) and Zone Maps for fast vector scans.
+ * Enforces strict 8-byte CRC32 footer verification and bounded chunk allocation.
  */
 public class ColumnarChunk {
+
+    public static final int MAX_CHUNK_FILE_SIZE = 512 * 1024 * 1024; // 512 MB
+    public static final int MAX_ROW_COUNT = 10_000_000;
 
     private final long chunkId;
     private final Schema schema;
     private final int rowCount;
     private final Map<String, ZoneMap> zoneMaps;
     private final Map<String, byte[]> encodedColumns;
-    private final Map<String, List<ColumnValue>> decodedCache;
+
+    // Cache of decoded columns for vectorized evaluation
+    private final ConcurrentHashMap<String, List<ColumnValue>> decodedCache = new ConcurrentHashMap<>();
 
     public ColumnarChunk(long chunkId, Schema schema, int rowCount,
-                         Map<String, ZoneMap> zoneMaps,
-                         Map<String, byte[]> encodedColumns) {
+                         Map<String, ZoneMap> zoneMaps, Map<String, byte[]> encodedColumns) {
         this.chunkId = chunkId;
         this.schema = schema;
         this.rowCount = rowCount;
-        this.zoneMaps = Collections.unmodifiableMap(zoneMaps);
-        this.encodedColumns = Collections.unmodifiableMap(encodedColumns);
-        this.decodedCache = new HashMap<>();
+        this.zoneMaps = Collections.unmodifiableMap(new HashMap<>(zoneMaps));
+        this.encodedColumns = Collections.unmodifiableMap(new HashMap<>(encodedColumns));
     }
 
-    public long getChunkId() { return chunkId; }
-    public Schema getSchema() { return schema; }
-    public int getRowCount() { return rowCount; }
+    public long getChunkId() {
+        return chunkId;
+    }
+
+    public Schema getSchema() {
+        return schema;
+    }
+
+    public int getRowCount() {
+        return rowCount;
+    }
 
     public ZoneMap getZoneMap(String columnName) {
         return zoneMaps.get(columnName);
+    }
+
+    public Map<String, ZoneMap> getZoneMaps() {
+        return zoneMaps;
     }
 
     public byte[] getEncodedColumn(String columnName) {
         return encodedColumns.get(columnName);
     }
 
+    public Map<String, byte[]> getEncodedColumns() {
+        return encodedColumns;
+    }
+
     /**
-     * Lazily decodes and caches a column for vectorized evaluation.
+     * Lazily decodes and caches column values in memory.
      */
-    public synchronized List<ColumnValue> getDecodedColumn(String columnName) {
-        List<ColumnValue> cached = decodedCache.get(columnName);
-        if (cached != null) return cached;
-
-        byte[] encoded = encodedColumns.get(columnName);
-        if (encoded == null) {
-            throw new IllegalArgumentException("Column not found in chunk: " + columnName);
-        }
-
-        ColumnDefinition def = schema.getColumn(columnName);
-        ColumnDecoder decoder = new ColumnDecoder(def.getType());
-        List<ColumnValue> decoded = decoder.decode(encoded);
-        decodedCache.put(columnName, decoded);
-        return decoded;
+    public List<ColumnValue> getDecodedColumn(String columnName) {
+        return decodedCache.computeIfAbsent(columnName, col -> {
+            byte[] encoded = encodedColumns.get(col);
+            if (encoded == null) {
+                return Collections.emptyList();
+            }
+            ColumnType type = schema.getColumnType(col);
+            if (type == null) {
+                type = ColumnType.STRING;
+            }
+            return ColumnDecoder.decode(encoded, type, rowCount);
+        });
     }
 
     private static void writeFully(FileChannel ch, ByteBuffer buf) throws IOException {
@@ -82,14 +100,14 @@ public class ColumnarChunk {
     private static void readFully(FileChannel ch, ByteBuffer buf) throws IOException {
         while (buf.hasRemaining()) {
             int read = ch.read(buf);
-            if (read < 0) {
-                throw new EOFException("Premature EOF reading columnar chunk");
+            if (read == -1) {
+                throw new EOFException("Premature EOF while reading columnar chunk file");
             }
         }
     }
 
     /**
-     * Serializes this columnar chunk into an immutable binary file via a temporary file with CRC32.
+     * Serializes this columnar chunk and writes it to disk via an atomic temporary file.
      */
     public void writeToFile(File file) throws IOException {
         File tempFile = new File(file.getParentFile(), file.getName() + ".tmp");
@@ -97,17 +115,25 @@ public class ColumnarChunk {
             tempFile.delete();
         }
 
-        int estimatedSize = 8192;
-        for (String colName : zoneMaps.keySet()) {
-            estimatedSize += colName.length() * 2 + 256;
-        }
+        // Calculate exact required buffer size
+        int totalEncodedBytes = 0;
         for (Map.Entry<String, byte[]> entry : encodedColumns.entrySet()) {
-            estimatedSize += entry.getKey().length() * 2 + entry.getValue().length + 128;
+            totalEncodedBytes += 4 + entry.getKey().getBytes(Constants.DEFAULT_CHARSET).length
+                    + 5 + entry.getValue().length;
         }
+
+        int totalZoneMapBytes = 0;
+        for (Map.Entry<String, ZoneMap> entry : zoneMaps.entrySet()) {
+            totalZoneMapBytes += 4 + entry.getKey().getBytes(Constants.DEFAULT_CHARSET).length
+                    + 100; // ZoneMap serialized upper bound
+        }
+
+        int estimatedSize = 32 + (schema.getColumnDefinitions().size() * 64)
+                + totalZoneMapBytes + totalEncodedBytes + 64;
 
         ByteBuffer buffer = ByteBuffer.allocate(estimatedSize);
 
-        // 1. Header (Magic, Version, ChunkId, RowCount)
+        // 1. Header: Magic (4) + Version (2) + ChunkId (8) + RowCount (4)
         buffer.putInt(Constants.COLUMNAR_MAGIC);
         buffer.putShort(Constants.COLUMNAR_VERSION);
         buffer.putLong(chunkId);
@@ -164,13 +190,16 @@ public class ColumnarChunk {
     }
 
     /**
-     * Reads a columnar chunk from an on-disk binary file with full validation and CRC check.
+     * Reads a columnar chunk from an on-disk binary file with strict validation and CRC check.
      */
     public static ColumnarChunk readFromFile(File file) throws IOException {
         try (FileChannel channel = FileChannel.open(file.toPath(), StandardOpenOption.READ)) {
             long fileSize = channel.size();
-            if (fileSize < 26) {
+            if (fileSize < 34) {
                 throw new IOException("Corrupt columnar chunk: file too small (" + fileSize + " bytes) in " + file.getName());
+            }
+            if (fileSize > MAX_CHUNK_FILE_SIZE) {
+                throw new IOException("Columnar chunk exceeds maximum permitted size (" + fileSize + " > " + MAX_CHUNK_FILE_SIZE + ") in " + file.getName());
             }
 
             ByteBuffer buffer = ByteBuffer.allocate((int) fileSize);
@@ -188,13 +217,16 @@ public class ColumnarChunk {
 
             long chunkId = buffer.getLong();
             int rowCount = buffer.getInt();
-            if (rowCount < 0) {
-                throw new IOException("Negative row count in columnar chunk " + file.getName());
+            if (rowCount < 0 || rowCount > MAX_ROW_COUNT) {
+                throw new IOException("Invalid row count " + rowCount + " in columnar chunk " + file.getName());
             }
 
             Schema schema = Schema.deserialize(buffer);
 
             int zoneMapCount = BinaryUtils.readVarInt(buffer);
+            if (zoneMapCount < 0 || zoneMapCount > 1000) {
+                throw new IOException("Invalid zone map count " + zoneMapCount + " in chunk " + file.getName());
+            }
             Map<String, ZoneMap> zoneMaps = new HashMap<>();
             for (int i = 0; i < zoneMapCount; i++) {
                 String colName = BinaryUtils.readString(buffer);
@@ -203,26 +235,35 @@ public class ColumnarChunk {
             }
 
             int colCount = BinaryUtils.readVarInt(buffer);
+            if (colCount < 0 || colCount > 1000) {
+                throw new IOException("Invalid encoded column count " + colCount + " in chunk " + file.getName());
+            }
             Map<String, byte[]> encodedColumns = new HashMap<>();
             for (int i = 0; i < colCount; i++) {
                 String colName = BinaryUtils.readString(buffer);
                 int dataLen = BinaryUtils.readVarInt(buffer);
-                if (dataLen < 0 || buffer.remaining() < dataLen) {
-                    throw new IOException("Corrupt encoded column data length in chunk " + file.getName());
+                if (dataLen < 0 || buffer.remaining() < dataLen + 8) {
+                    throw new IOException("Corrupt encoded column data length " + dataLen + " in chunk " + file.getName());
                 }
                 byte[] data = new byte[dataLen];
                 buffer.get(data);
                 encodedColumns.put(colName, data);
             }
 
-            if (buffer.remaining() >= 8) {
-                int payloadEnd = buffer.position();
-                long expectedChecksum = buffer.getLong();
-                CRC32 crc = new CRC32();
-                crc.update(buffer.array(), 0, payloadEnd);
-                if (crc.getValue() != expectedChecksum) {
-                    throw new IOException("Columnar chunk CRC mismatch in " + file.getName());
-                }
+            // Strictly require exactly 8 bytes remaining for the CRC32 footer
+            if (buffer.remaining() != 8) {
+                throw new IOException("Malformed columnar chunk in " + file.getName()
+                        + ": expected exactly 8-byte checksum footer, but found " + buffer.remaining() + " bytes remaining");
+            }
+
+            int payloadEnd = buffer.position();
+            long expectedChecksum = buffer.getLong();
+            CRC32 crc = new CRC32();
+            crc.update(buffer.array(), 0, payloadEnd);
+            long actualChecksum = crc.getValue();
+            if (actualChecksum != expectedChecksum) {
+                throw new IOException("Columnar chunk CRC mismatch in " + file.getName()
+                        + "! Expected=" + expectedChecksum + ", Actual=" + actualChecksum);
             }
 
             return new ColumnarChunk(chunkId, schema, rowCount, zoneMaps, encodedColumns);

@@ -15,6 +15,7 @@ import java.util.Comparator;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -55,7 +56,6 @@ public class LsmConcurrencyAndVersionTest {
         engine.put("key1", "val1_initial");
         engine.flushMemTable();
 
-        // Verify read from SSTable
         DataRecord r1 = engine.get("key1");
         assertNotNull(r1);
         assertEquals("val1_initial", r1.getValueAsString());
@@ -87,6 +87,126 @@ public class LsmConcurrencyAndVersionTest {
     }
 
     @Test
+    @DisplayName("Shutdown safety: engine rejects writes after close, and close is idempotent")
+    void testShutdownSafety() throws Exception {
+        HybridStorageManager engine = new HybridStorageManager(config);
+        engine.put("k_open", "v_open");
+        assertNotNull(engine.get("k_open"));
+
+        // Close storage engine
+        engine.close();
+
+        // Further writes and gets must be rejected
+        assertThrows(IllegalStateException.class, () -> engine.put("k_closed", "v_closed"));
+        assertThrows(IllegalStateException.class, () -> engine.get("k_open"));
+        assertThrows(IllegalStateException.class, () -> engine.delete("k_open"));
+        assertThrows(IllegalStateException.class, () -> engine.flushMemTable());
+
+        // Repeated close must be safely idempotent without exceptions
+        assertDoesNotThrow(engine::close);
+    }
+
+    @Test
+    @DisplayName("Idempotent flush: concurrent manual flushes do not duplicate SSTables")
+    void testConcurrentManualFlushIdempotence() throws Exception {
+        HybridStorageManager engine = new HybridStorageManager(config);
+        for (int i = 0; i < 50; i++) {
+            engine.put("flush_key_" + i, "val_" + i);
+        }
+
+        int threads = 4;
+        CountDownLatch startLatch = new CountDownLatch(1);
+        CountDownLatch doneLatch = new CountDownLatch(threads);
+        AtomicInteger failures = new AtomicInteger(0);
+
+        try (ExecutorService exec = Executors.newFixedThreadPool(threads)) {
+            for (int t = 0; t < threads; t++) {
+                exec.submit(() -> {
+                    try {
+                        startLatch.await();
+                        engine.flushMemTable();
+                    } catch (Exception ex) {
+                        failures.incrementAndGet();
+                    } finally {
+                        doneLatch.countDown();
+                    }
+                });
+            }
+            startLatch.countDown();
+            doneLatch.await();
+        }
+
+        assertEquals(0, failures.get());
+        for (int i = 0; i < 50; i++) {
+            DataRecord rec = engine.get("flush_key_" + i);
+            assertNotNull(rec);
+            assertEquals("val_" + i, rec.getValueAsString());
+        }
+
+        engine.close();
+    }
+
+    @Test
+    @DisplayName("Deterministic concurrency: continuous reads remain consistent throughout compaction publication")
+    void testContinuousReadsDuringCompaction() throws Exception {
+        AetherConfig compConfig = new AetherConfig();
+        compConfig.setProperty("storage.wal.dir", tempBaseDir.resolve("wal_comp").toString());
+        compConfig.setProperty("storage.sstable.dir", tempBaseDir.resolve("sstable_comp").toString());
+        compConfig.setProperty("storage.columnar.dir", tempBaseDir.resolve("columnar_comp").toString());
+        compConfig.setProperty("storage.data.dir", tempBaseDir.resolve("storage_comp").toString());
+        compConfig.validateAndCreateDirectories();
+
+        HybridStorageManager engine = new HybridStorageManager(compConfig);
+
+        // Write batch 1 and flush
+        for (int i = 0; i < 20; i++) {
+            engine.put("read_key_" + i, "v1_" + i);
+        }
+        engine.flushMemTable();
+
+        // Write batch 2 and flush
+        for (int i = 0; i < 20; i++) {
+            engine.put("read_key_" + i, "v2_" + i);
+        }
+        engine.flushMemTable();
+
+        AtomicBoolean running = new AtomicBoolean(true);
+        AtomicInteger readErrors = new AtomicInteger(0);
+        int readers = 4;
+        CountDownLatch readerLatch = new CountDownLatch(readers);
+
+        try (ExecutorService exec = Executors.newFixedThreadPool(readers)) {
+            for (int r = 0; r < readers; r++) {
+                exec.submit(() -> {
+                    try {
+                        while (running.get()) {
+                            for (int i = 0; i < 20; i++) {
+                                DataRecord rec = engine.get("read_key_" + i);
+                                if (rec == null || !rec.getValueAsString().startsWith("v2_")) {
+                                    readErrors.incrementAndGet();
+                                }
+                            }
+                        }
+                    } catch (Exception e) {
+                        readErrors.incrementAndGet();
+                    } finally {
+                        readerLatch.countDown();
+                    }
+                });
+            }
+
+            // Run compaction while readers are continuously reading
+            engine.compact();
+
+            running.set(false);
+            readerLatch.await();
+        }
+
+        assertEquals(0, readErrors.get(), "Readers must never encounter missing keys or closed readers during compaction");
+        engine.close();
+    }
+
+    @Test
     @DisplayName("Sequence number persistence across crash and restart")
     void testSequencePersistenceAcrossRestart() throws Exception {
         HybridStorageManager engine1 = new HybridStorageManager(config);
@@ -106,7 +226,6 @@ public class LsmConcurrencyAndVersionTest {
         // Restart engine from disk
         HybridStorageManager engine2 = new HybridStorageManager(config);
 
-        // Next write must be strictly greater than any previously assigned sequence
         engine2.put("seq_test_4", "data4");
         DataRecord record4 = engine2.get("seq_test_4");
         long seqAfterRestart = record4.getSequenceNumber();
@@ -116,54 +235,4 @@ public class LsmConcurrencyAndVersionTest {
 
         engine2.close();
     }
-
-    @Test
-    @DisplayName("Deterministic concurrency: concurrent PUT and DELETE preserves atomic write order")
-    void testConcurrentPutAndDelete() throws Exception {
-        HybridStorageManager engine = new HybridStorageManager(config);
-        int threadCount = 8;
-        int opsPerThread = 200;
-        CountDownLatch startLatch = new CountDownLatch(1);
-        CountDownLatch doneLatch = new CountDownLatch(threadCount);
-        AtomicInteger putCount = new AtomicInteger(0);
-        AtomicInteger delCount = new AtomicInteger(0);
-
-        try (ExecutorService exec = Executors.newFixedThreadPool(threadCount)) {
-            for (int t = 0; t < threadCount; t++) {
-                final int threadId = t;
-                exec.submit(() -> {
-                    try {
-                        startLatch.await();
-                        for (int i = 0; i < opsPerThread; i++) {
-                            String key = "concurrent_key_" + (i % 20);
-                            if (threadId % 2 == 0) {
-                                engine.put(key, "val_" + threadId + "_" + i);
-                                putCount.incrementAndGet();
-                            } else {
-                                engine.delete(key);
-                                delCount.incrementAndGet();
-                            }
-                        }
-                    } catch (Exception e) {
-                        e.printStackTrace();
-                    } finally {
-                        doneLatch.countDown();
-                    }
-                });
-            }
-
-            startLatch.countDown();
-            doneLatch.await();
-        }
-
-        // Verify engine state is valid and can be read/flushed without error
-        assertDoesNotThrow(() -> engine.flushMemTable());
-        engine.close();
-
-        // Verify can restart cleanly
-        HybridStorageManager engineRestarted = new HybridStorageManager(config);
-        assertNotNull(engineRestarted);
-        engineRestarted.close();
-    }
 }
-

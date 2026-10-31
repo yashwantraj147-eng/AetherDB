@@ -24,6 +24,7 @@ public class ColumnValue implements Comparable<ColumnValue> {
     public static ColumnValue ofBoolean(boolean val) { return new ColumnValue(ColumnType.BOOLEAN, val); }
     public static ColumnValue ofTimestamp(long epochMs) { return new ColumnValue(ColumnType.TIMESTAMP, epochMs); }
     public static ColumnValue ofNull(ColumnType type) { return new ColumnValue(type, null); }
+    public static ColumnValue ofNull() { return new ColumnValue(null, null); }
 
     public ColumnType getType() { return type; }
     public Object getValue() { return value; }
@@ -63,6 +64,10 @@ public class ColumnValue implements Comparable<ColumnValue> {
         if (this.value == null && o.value == null) return 0;
         if (this.value == null) return -1;
         if (o.value == null) return 1;
+
+        if (this.type == null || o.type == null) {
+            return 0;
+        }
 
         return switch (this.type) {
             case INT32 -> Integer.compare(this.asInt(), o.asInt());

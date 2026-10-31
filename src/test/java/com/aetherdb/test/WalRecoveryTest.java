@@ -13,12 +13,12 @@ import org.junit.jupiter.api.Test;
 
 import java.io.File;
 import java.io.RandomAccessFile;
-import java.nio.ByteBuffer;
-import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -78,7 +78,7 @@ public class WalRecoveryTest {
     }
 
     @Test
-    @DisplayName("Torn-tail handling: incomplete trailing record at EOF is truncated safely")
+    @DisplayName("Case A - Torn-tail handling: demonstrably incomplete trailing bytes at EOF are truncated safely")
     void testTornTailTruncation() throws Exception {
         File walFile = new File(tempWalDir.toFile(), WriteAheadLog.formatSegmentFilename(1));
         WriteAheadLog wal = new WriteAheadLog(walFile, AetherConfig.WalSyncMode.IMMEDIATE, 50);
@@ -90,17 +90,17 @@ public class WalRecoveryTest {
         long validSize = walFile.length();
         assertTrue(validSize > 0);
 
-        // Intentionally append partial corrupted bytes to simulate a power failure / crash mid-write
+        // Intentionally append partial bytes to simulate crash mid-write
         try (RandomAccessFile raf = new RandomAccessFile(walFile, "rw")) {
             raf.seek(validSize);
-            raf.writeInt(0x12345678); // Bogus CRC
+            raf.writeInt(0x12345678); // CRC
             raf.writeInt(100);        // Claimed length 100 bytes
-            raf.write(new byte[]{1, 2, 3, 4}); // Only 4 bytes written before crash
+            raf.write(new byte[]{1, 2, 3, 4}); // Only 4 bytes written before EOF
         }
 
         assertTrue(walFile.length() > validSize);
 
-        // Recovery should detect torn tail, truncate the file to validSize, and recover the 2 valid records
+        // Recovery detects incomplete tail, truncates to validSize, and recovers 2 valid records
         WriteAheadLog recoverWal = new WriteAheadLog(walFile, AetherConfig.WalSyncMode.IMMEDIATE, 50);
         List<DataRecord> records = recoverWal.recover();
 
@@ -111,13 +111,63 @@ public class WalRecoveryTest {
         // Verify file was truncated back to valid size
         assertEquals(validSize, walFile.length());
 
-        // Subsequent appends should work cleanly without hitting corruption
+        // Subsequent appends work cleanly
         recoverWal.append(DataRecord.put("valid3", "data3", 3));
         recoverWal.close();
 
         List<DataRecord> secondRecovery = WriteAheadLog.recoverAllSegments(tempWalDir.toFile());
         assertEquals(3, secondRecovery.size());
         assertEquals("valid3", secondRecovery.get(2).getKeyAsString());
+    }
+
+    @Test
+    @DisplayName("Case B - Complete frame with bad CRC throws CorruptedWalException and is NOT truncated")
+    void testCompleteFrameWithBadCrcThrowsCorruptedWalException() throws Exception {
+        File walFile = new File(tempWalDir.toFile(), WriteAheadLog.formatSegmentFilename(1));
+        WriteAheadLog wal = new WriteAheadLog(walFile, AetherConfig.WalSyncMode.IMMEDIATE, 50);
+
+        wal.append(DataRecord.put("rec1", "data1", 1));
+        wal.append(DataRecord.put("rec2", "data2", 2));
+        wal.close();
+
+        long originalSize = walFile.length();
+
+        // Corrupt the CRC or payload of rec2 without changing its length
+        try (RandomAccessFile raf = new RandomAccessFile(walFile, "rw")) {
+            // Seek into payload of the second record and flip bits
+            raf.seek(originalSize - 5);
+            byte b = raf.readByte();
+            raf.seek(originalSize - 5);
+            raf.writeByte(b ^ 0xFF);
+        }
+
+        // Recovery must THROW CorruptedWalException, and must NOT silently truncate the record
+        assertThrows(CorruptedWalException.class, () -> {
+            WriteAheadLog.recoverFile(walFile, null, null);
+        });
+
+        // Verify the file was NOT silently truncated
+        assertEquals(originalSize, walFile.length(), "File must not be truncated when complete frame has bad CRC");
+    }
+
+    @Test
+    @DisplayName("Streaming recovery callback processes records incrementally without giant list allocation")
+    void testStreamingRecoveryCallback() throws Exception {
+        File walFile = new File(tempWalDir.toFile(), WriteAheadLog.formatSegmentFilename(1));
+        WriteAheadLog wal = new WriteAheadLog(walFile, AetherConfig.WalSyncMode.IMMEDIATE, 50);
+
+        int count = 100;
+        for (int i = 0; i < count; i++) {
+            wal.append(DataRecord.put("key_" + i, "val_" + i, i));
+        }
+        wal.close();
+
+        AtomicInteger streamedCount = new AtomicInteger(0);
+        WriteAheadLog.recoverAllSegments(tempWalDir.toFile(), r -> {
+            streamedCount.incrementAndGet();
+        });
+
+        assertEquals(count, streamedCount.get());
     }
 
     @Test
@@ -133,5 +183,18 @@ public class WalRecoveryTest {
             WriteAheadLog.recoverFile(walFile, null, null);
         });
     }
-}
 
+    @Test
+    @DisplayName("Unsupported WAL version in header throws CorruptedWalException")
+    void testUnsupportedWalVersion() throws Exception {
+        File walFile = new File(tempWalDir.toFile(), WriteAheadLog.formatSegmentFilename(1));
+        try (RandomAccessFile raf = new RandomAccessFile(walFile, "rw")) {
+            raf.writeInt(Constants.WAL_MAGIC);
+            raf.writeShort((short) 999); // Unsupported version
+        }
+
+        assertThrows(CorruptedWalException.class, () -> {
+            WriteAheadLog.recoverFile(walFile, null, null);
+        });
+    }
+}
