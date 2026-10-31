@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-JAR_FILE="$SCRIPT_DIR/target/aetherdb-2.0.0-SNAPSHOT.jar"
+JAR_FILE="$SCRIPT_DIR/target/aetherdb-2.0.0.jar"
 
 if [ ! -f "$JAR_FILE" ]; then
     echo "[INFO] Packaging AetherDB executable jar..."

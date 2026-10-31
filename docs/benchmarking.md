@@ -40,6 +40,6 @@ Execute the packaged benchmark harness:
 mvn clean package -DskipTests
 
 # Run benchmark with 4 worker threads, 5,000 ops/worker
-java -cp target/aetherdb-2.0.0-SNAPSHOT.jar com.aetherdb.cli.AetherBenchmark 4 5000
+java -cp target/aetherdb-2.0.0.jar com.aetherdb.cli.AetherBenchmark 4 5000
 ```
 

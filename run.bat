@@ -1,7 +1,7 @@
 @echo off
 setlocal
 
-set JAR_FILE=%~dp0target\aetherdb-2.0.0-SNAPSHOT.jar
+set JAR_FILE=%~dp0target\aetherdb-2.0.0.jar
 if not exist "%JAR_FILE%" (
     echo [INFO] Packaging AetherDB executable jar...
     call "%~dp0build.bat"
