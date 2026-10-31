@@ -14,19 +14,19 @@ All notable changes and architectural repairs in **AetherDB V2** are documented 
 - **Safe Retryable Shutdown**: If in-flight tasks exceed the bounded shutdown timeout, resources (WAL and SSTable readers) remain open in `CLOSING` state and `close()` throws an `IOException`, permitting safe retry without resource leaks or thread hangs.
 
 ### Flush Future and Retry Coordination (Priority 0)
-- **Atomic Flush Attempt Claiming**: Implemented `claimFlushAttempt()` on `MemTable` to safely transition `SEALED`, `QUEUED`, or `FAILED` states to `FLUSHING` with a fresh `CompletableFuture<File>` per attempt.
-- **Stale Future Reuse Prevention**: Subsequent flush attempts after transient failures never reuse already completed exceptional futures. Concurrent callers safely coordinate and await the active attempt's future.
-- **Directory Writeability Verification in Flush Retries**: `retryFailedFlushes()` verifies storage directory writeability with a temporary probe file before clearing `FAILED` state and re-attempting pending flushes.
+- **FAILED-State Admission in Recovery**: Updated `enterOperation(boolean allowFailed)` to admit `retryFailedFlushes()` when the storage engine is in `FAILED` state, while continuing to strictly reject mutating writes (`put`, `delete`), compactions, and scans.
+- **Indivisible Atomic FlushState Publication**: Replaced decoupled state and future variables in `MemTable` with an atomic `FlushState` holder. In `claimFlushAttempt()`, state transition to `FLUSHING` and publication of the newly allocated `CompletableFuture<SSTableReader>` are executed atomically in a single CAS. No concurrent thread can observe `FLUSHING` before the future is available.
+- **Storage Directory Writeability Probe**: `retryFailedFlushes()` verifies storage directory writeability using a temporary probe file before clearing `FAILED` state and flushing pending memtables.
 
 ### Compaction Iterator Constructor Cleanup Safety (Priority 1)
 - **Exception-Safe Iterator Initialization**: Wrapped source iterator acquisition and initial entry advancement in `CompactionEngine.StreamingMergeIterator` constructor in a try-catch block.
 - **Guaranteed Reader Cleanup on Construction Failure**: If any iterator acquisition or block read fails during iterator construction, all previously opened iterators are safely closed, and any cleanup errors are attached as suppressed exceptions to the primary cause.
 
-### Table Schema Registration & Columnar Ingestion Rules (Priority 1)
-- **Strict Table Name Validation**: Enforced pattern validation (`^[a-zA-Z0-9_]{1,128}$`) on table names and verified exact equality between registration argument and `schema.getTableName()`.
-- **Idempotent Re-registration**: Allowed re-registering identical schemas idempotently without error.
-- **Schema Mutation Protection**: Replaced schema validation ensures incompatible column additions or modified data types are rejected with `IllegalArgumentException`.
-- **Loaded Chunk Consistency Check**: Registering a schema for existing tables verifies compatibility across all pre-existing columnar chunks on disk.
+### Table Schema Registration & Columnar Ingestion Synchronization (Priority 1)
+- **Lifecycle Operation Tracking for Schemas**: Included `registerTableSchema()` in lifecycle admission tracking via `enterOperation()` and `exitOperation()`, ensuring shutdown coordinates safe completion before termination.
+- **Thread-Safe Schema Registration**: Added per-table synchronization locks via `getTableLock(tableName)`. Concurrent threads attempting to register conflicting schemas for the same table are serialized; the first registration wins and conflicting registrations are rejected with `IllegalArgumentException`.
+- **Ingestion Synchronization**: Synchronized `registerTableSchema()`, `getOrInferTableSchema()`, and `ingestColumnar()` on `getTableLock(tableName)`, eliminating races between schema inference and chunk writing.
+- **Strict Table Name Validation & Chunk Compatibility**: Enforces pattern validation (`^[a-zA-Z0-9_]{1,128}$`), validates exact equality with `schema.getTableName()`, allows idempotent identical registrations, and checks compatibility against existing disk chunks.
 
 ### ZoneMap Immutability & Deserialization Hardening (Priority 1)
 - **ZoneMap Immutability Flag**: Introduced `freeze()`, `isFrozen()`, and `toImmutable()` on `ZoneMap`. Attempting to modify frozen ZoneMaps via `update()` throws `UnsupportedOperationException`.
@@ -34,7 +34,8 @@ All notable changes and architectural repairs in **AetherDB V2** are documented 
 - **Deserialization Sanity Checks**: `ZoneMap.deserialize()` validates record counts (`rowCount >= 0`, `nullCount >= 0`, `rowCount >= nullCount`) and min/max consistency (`min <= max`), rejecting corrupted or malicious stream data with `CorruptedSchemaException`.
 
 ### Build & Test Suite Expansion (Priority 2)
-- **78 Automated Unit & Regression Tests**: Test suite expanded from 68 to 78 automated JUnit 5 tests covering manual flush vs close races, compaction vs close races, iterator construction cleanup, schema registration constraints, and ZoneMap immutability with 100% pass rate.
+- **Deterministic Concurrency & Fault Injection Hooks**: Added testing hooks (`onBeforeFlushPublicationHook`, `onBeforeCompactionPublicationHook`, `onWalRotationFailureHook`) enabling deterministic multi-threaded synchronization via `CountDownLatch` and `CyclicBarrier` without timing assumptions or sleep polling.
+- **83 Automated Unit & Regression Tests**: Test suite expanded to 83 automated JUnit 5 tests across 12 test suites, with all tests passing (100% green). Verified under Java 21 canonical Maven build on Windows and Ubuntu CI.
 
 ---
 

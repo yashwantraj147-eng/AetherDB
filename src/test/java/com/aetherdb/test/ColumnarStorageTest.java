@@ -23,6 +23,8 @@ import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -490,5 +492,112 @@ public class ColumnarStorageTest {
         assertEquals(50L, zm.getMinVal().asLong());
         assertEquals(100L, zm.getMaxVal().asLong());
         assertThrows(UnsupportedOperationException.class, () -> zm.update(ColumnValue.ofLong(200L)));
+    }
+
+    @Test
+    @DisplayName("Concurrent schema registration: exactly one schema retained when threads race with incompatible definitions")
+    void testConcurrentIncompatibleSchemaRegistration() throws Exception {
+        String tableName = "race_table";
+        int threadCount = 10;
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+        CyclicBarrier barrier = new CyclicBarrier(threadCount);
+
+        List<ColumnDefinition> colsTypeA = List.of(
+                new ColumnDefinition("id", ColumnType.INT64),
+                new ColumnDefinition("metric", ColumnType.STRING)
+        );
+        Schema schemaA = new Schema(tableName, colsTypeA);
+
+        List<ColumnDefinition> colsTypeB = List.of(
+                new ColumnDefinition("id", ColumnType.INT64),
+                new ColumnDefinition("metric", ColumnType.FLOAT64)
+        );
+        Schema schemaB = new Schema(tableName, colsTypeB);
+
+        AtomicInteger successCount = new AtomicInteger(0);
+        AtomicInteger rejectedCount = new AtomicInteger(0);
+        List<Future<?>> futures = new ArrayList<>();
+
+        for (int i = 0; i < threadCount; i++) {
+            final boolean useA = (i % 2 == 0);
+            futures.add(executor.submit(() -> {
+                try {
+                    barrier.await();
+                    storage.registerTableSchema(tableName, useA ? schemaA : schemaB);
+                    successCount.incrementAndGet();
+                } catch (IllegalArgumentException e) {
+                    rejectedCount.incrementAndGet();
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }));
+        }
+
+        for (Future<?> f : futures) {
+            f.get(5, TimeUnit.SECONDS);
+        }
+        executor.shutdown();
+
+        // Exactly one schema type won
+        Schema registered = storage.getTableSchema(tableName);
+        assertNotNull(registered);
+        boolean isA = registered.equals(schemaA);
+        boolean isB = registered.equals(schemaB);
+        assertTrue(isA ^ isB, "Retained schema must be either schemaA or schemaB");
+
+        // The threads that submitted the winning schema succeeded (idempotent re-registration);
+        // all threads that submitted the conflicting schema were rejected with IllegalArgumentException
+        assertEquals(threadCount / 2, successCount.get(), "All threads submitting the winning schema succeed");
+        assertEquals(threadCount / 2, rejectedCount.get(), "All threads submitting conflicting schema must be rejected");
+    }
+
+    @Test
+    @DisplayName("Synchronized schema registration & ingestion: registerTableSchema and ingestColumnar race safely without inconsistent schemas")
+    void testSchemaRegistrationSynchronizedWithIngestion() throws Exception {
+        String tableName = "sync_ingest_tbl";
+        int threads = 6;
+        ExecutorService executor = Executors.newFixedThreadPool(threads);
+        CyclicBarrier barrier = new CyclicBarrier(threads);
+
+        Schema declaredSchema = new Schema(tableName, List.of(
+                new ColumnDefinition("id", ColumnType.INT64),
+                new ColumnDefinition("tag", ColumnType.STRING)
+        ));
+
+        List<Future<?>> futures = new ArrayList<>();
+        AtomicInteger registrationSuccess = new AtomicInteger(0);
+        AtomicInteger ingestionSuccess = new AtomicInteger(0);
+
+        for (int i = 0; i < threads; i++) {
+            final int idx = i;
+            futures.add(executor.submit(() -> {
+                try {
+                    barrier.await();
+                    if (idx % 2 == 0) {
+                        storage.registerTableSchema(tableName, declaredSchema);
+                        registrationSuccess.incrementAndGet();
+                    } else {
+                        storage.ingestColumnar(tableName, List.of(
+                                Map.of("id", ColumnValue.ofLong(idx), "tag", ColumnValue.ofString("val_" + idx))
+                        ));
+                        ingestionSuccess.incrementAndGet();
+                    }
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }));
+        }
+
+        for (Future<?> f : futures) {
+            f.get(5, TimeUnit.SECONDS);
+        }
+        executor.shutdown();
+
+        assertEquals(declaredSchema, storage.getTableSchema(tableName));
+        List<ColumnarChunk> chunks = storage.getColumnarChunks(tableName);
+        assertFalse(chunks.isEmpty());
+        for (ColumnarChunk c : chunks) {
+            assertEquals(declaredSchema, c.getSchema());
+        }
     }
 }

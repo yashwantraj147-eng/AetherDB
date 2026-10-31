@@ -30,13 +30,34 @@ public class MemTable implements Iterable<DataRecord> {
         FAILED
     }
 
+    /**
+     * Immutable snapshot holding MemTable State and its active flush CompletableFuture.
+     * Guarantees atomic state transitions and future publication.
+     */
+    public static final class FlushState {
+        private final State state;
+        private final CompletableFuture<SSTableReader> future;
+
+        public FlushState(State state, CompletableFuture<SSTableReader> future) {
+            this.state = state;
+            this.future = future;
+        }
+
+        public State getState() {
+            return state;
+        }
+
+        public CompletableFuture<SSTableReader> getFuture() {
+            return future;
+        }
+    }
+
     private final long id;
     private final ConcurrentSkipListMap<byte[], DataRecord> map;
     private final AtomicLong byteSize = new AtomicLong(0);
-    private final AtomicReference<State> state = new AtomicReference<>(State.ACTIVE);
+    private final AtomicReference<FlushState> flushState = new AtomicReference<>(new FlushState(State.ACTIVE, null));
 
     private volatile File associatedWalFile;
-    private volatile CompletableFuture<SSTableReader> flushFuture;
 
     private volatile long minSequenceNumber = Long.MAX_VALUE;
     private volatile long maxSequenceNumber = Long.MIN_VALUE;
@@ -47,15 +68,19 @@ public class MemTable implements Iterable<DataRecord> {
     }
 
     public State getState() {
-        return state.get();
+        return flushState.get().getState();
     }
 
     public boolean transitionTo(State expected, State newState) {
-        return state.compareAndSet(expected, newState);
+        FlushState cur = flushState.get();
+        if (cur.getState() == expected) {
+            return flushState.compareAndSet(cur, new FlushState(newState, cur.getFuture()));
+        }
+        return false;
     }
 
     public void setState(State newState) {
-        state.set(newState);
+        flushState.updateAndGet(cur -> new FlushState(newState, cur.getFuture()));
     }
 
     public long getId() {
@@ -71,26 +96,31 @@ public class MemTable implements Iterable<DataRecord> {
     }
 
     public CompletableFuture<SSTableReader> getFlushFuture() {
-        return flushFuture;
+        return flushState.get().getFuture();
     }
 
     public void setFlushFuture(CompletableFuture<SSTableReader> flushFuture) {
-        this.flushFuture = flushFuture;
+        flushState.updateAndGet(cur -> new FlushState(cur.getState(), flushFuture));
+    }
+
+    public FlushState getFlushState() {
+        return flushState.get();
     }
 
     /**
      * Atomically claims ownership of a flush attempt for this MemTable.
-     * If the table is in SEALED, QUEUED, or FAILED state, it transitions to FLUSHING,
-     * assigns a brand-new CompletableFuture representing this attempt, and returns the future.
-     * If another thread already claimed the attempt and it is actively running, returns null
-     * so callers can await the active getFlushFuture().
+     * If the table is in SEALED, QUEUED, or FAILED state, it atomically transitions to FLUSHING
+     * and publishes a brand-new CompletableFuture representing this attempt in a single CAS.
+     * No concurrent thread can observe FLUSHING without the corresponding future available.
+     * If another thread already claimed the attempt, returns null so callers can await the active future.
      */
     public synchronized CompletableFuture<SSTableReader> claimFlushAttempt() {
-        State current = state.get();
-        if (current == State.SEALED || current == State.QUEUED || current == State.FAILED) {
-            state.set(State.FLUSHING);
-            this.flushFuture = new CompletableFuture<>();
-            return this.flushFuture;
+        FlushState current = flushState.get();
+        State st = current.getState();
+        if (st == State.SEALED || st == State.QUEUED || st == State.FAILED) {
+            CompletableFuture<SSTableReader> newFuture = new CompletableFuture<>();
+            flushState.set(new FlushState(State.FLUSHING, newFuture));
+            return newFuture;
         }
         return null;
     }

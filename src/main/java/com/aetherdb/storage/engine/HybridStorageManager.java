@@ -73,6 +73,17 @@ public class HybridStorageManager implements StorageEngine {
     private final AtomicLong totalDeletes = new AtomicLong(0);
     private final AtomicLong memtableHits = new AtomicLong(0);
     private final AtomicLong sstableHits = new AtomicLong(0);
+    // Testing hooks for deterministic concurrency and fault injection
+    public volatile Runnable onBeforeFlushPublicationHook = null;
+    public volatile Runnable onBeforeCompactionPublicationHook = null;
+    public volatile Runnable onWalRotationFailureHook = null;
+
+    private final ConcurrentHashMap<String, Object> tableLocks = new ConcurrentHashMap<>();
+
+    private Object getTableLock(String tableName) {
+        return tableLocks.computeIfAbsent(tableName, k -> new Object());
+    }
+
     private final AtomicLong bloomFilterMisses = new AtomicLong(0);
 
     public HybridStorageManager(AetherConfig config) throws IOException {
@@ -209,14 +220,22 @@ public class HybridStorageManager implements StorageEngine {
     }
 
     private void enterOperation() {
+        enterOperation(false);
+    }
+
+    private void enterOperation(boolean allowFailed) {
         LifecycleState current = lifecycleState.get();
-        if (current != LifecycleState.OPEN) {
-            throw new IllegalStateException("Storage engine is " + current + (failureReason != null ? ": " + failureReason : ""));
+        if (current == LifecycleState.CLOSING || current == LifecycleState.CLOSED) {
+            throw new IllegalStateException("Storage engine is " + current);
+        }
+        if (!allowFailed && current == LifecycleState.FAILED) {
+            throw new IllegalStateException("Storage engine is in FAILED state: " + failureReason);
         }
         activeOperations.incrementAndGet();
-        if (lifecycleState.get() != LifecycleState.OPEN) {
+        LifecycleState afterInc = lifecycleState.get();
+        if (afterInc == LifecycleState.CLOSING || afterInc == LifecycleState.CLOSED || (!allowFailed && afterInc == LifecycleState.FAILED)) {
             activeOperations.decrementAndGet();
-            throw new IllegalStateException("Storage engine is " + lifecycleState.get() + (failureReason != null ? ": " + failureReason : ""));
+            throw new IllegalStateException("Storage engine is " + afterInc + (failureReason != null ? ": " + failureReason : ""));
         }
     }
 
@@ -398,11 +417,15 @@ public class HybridStorageManager implements StorageEngine {
         long nextSegId = walSegmentIdGenerator.getAndIncrement();
         File rotatedWal;
         try {
+            if (onWalRotationFailureHook != null) {
+                onWalRotationFailureHook.run();
+            }
             rotatedWal = wal.rotate(nextSegId);
-        } catch (IOException e) {
+        } catch (Exception e) {
             this.failureReason = "WAL rotation failed: " + e.getMessage();
             this.lifecycleState.set(LifecycleState.FAILED);
             System.err.println("CRITICAL: WAL rotation failed during flush trigger: " + e.getMessage());
+            if (e instanceof IOException ioe) throw ioe;
             throw new IOException("WAL rotation failed; engine entered FAILED state to protect durability", e);
         }
 
@@ -427,6 +450,10 @@ public class HybridStorageManager implements StorageEngine {
                 MemTableFlushTask flushTask = new MemTableFlushTask(
                         sealedMemTable, sstableDir, tableId, config, walSegmentToRetire);
                 SSTableReader newReader = flushTask.execute();
+
+                if (onBeforeFlushPublicationHook != null) {
+                    onBeforeFlushPublicationHook.run();
+                }
 
                 rwLock.writeLock().lock();
                 try {
@@ -496,6 +523,10 @@ public class HybridStorageManager implements StorageEngine {
                                 imm, sstableDir, tableId, config, imm.getAssociatedWalFile());
                         SSTableReader newReader = flushTask.execute();
 
+                        if (onBeforeFlushPublicationHook != null) {
+                            onBeforeFlushPublicationHook.run();
+                        }
+
                         rwLock.writeLock().lock();
                         try {
                             LifecycleState state = lifecycleState.get();
@@ -544,6 +575,9 @@ public class HybridStorageManager implements StorageEngine {
                 }
                 if (!activeMemTable.isEmpty()) {
                     long nextSegId = walSegmentIdGenerator.getAndIncrement();
+                    if (onWalRotationFailureHook != null) {
+                        onWalRotationFailureHook.run();
+                    }
                     rotatedWal = wal.rotate(nextSegId);
                     tableToFlush = activeMemTable;
                     tableToFlush.setState(MemTable.State.SEALED);
@@ -552,10 +586,11 @@ public class HybridStorageManager implements StorageEngine {
                     activeMemTable = new MemTable(System.currentTimeMillis());
                     immutableMemTables.add(tableToFlush);
                 }
-            } catch (IOException e) {
+            } catch (Exception e) {
                 this.failureReason = "WAL rotation failed during manual flush: " + e.getMessage();
                 this.lifecycleState.set(LifecycleState.FAILED);
-                throw e;
+                if (e instanceof IOException ioe) throw ioe;
+                throw new IOException("WAL rotation failed during manual flush: " + e.getMessage(), e);
             } finally {
                 rwLock.writeLock().unlock();
             }
@@ -566,6 +601,10 @@ public class HybridStorageManager implements StorageEngine {
                     MemTableFlushTask flushTask = new MemTableFlushTask(
                             tableToFlush, sstableDir, tableId, config, rotatedWal);
                     SSTableReader newReader = flushTask.execute();
+
+                    if (onBeforeFlushPublicationHook != null) {
+                        onBeforeFlushPublicationHook.run();
+                    }
 
                     rwLock.writeLock().lock();
                     try {
@@ -597,7 +636,7 @@ public class HybridStorageManager implements StorageEngine {
 
     @Override
     public void retryFailedFlushes() throws IOException {
-        enterOperation();
+        enterOperation(true);
         try {
             rwLock.writeLock().lock();
             try {
@@ -665,6 +704,10 @@ public class HybridStorageManager implements StorageEngine {
                     canPruneTombstones
             );
 
+            if (onBeforeCompactionPublicationHook != null) {
+                onBeforeCompactionPublicationHook.run();
+            }
+
             // Atomic publication transaction:
             rwLock.writeLock().lock();
             try {
@@ -700,42 +743,49 @@ public class HybridStorageManager implements StorageEngine {
 
     @Override
     public void registerTableSchema(String tableName, Schema schema) {
-        if (tableName == null || !TABLE_NAME_PATTERN.matcher(tableName).matches()) {
-            throw new IllegalArgumentException("Invalid table name: '" + tableName + "'. Must be alphanumeric and up to 64 chars.");
-        }
-        if (schema == null) {
-            throw new IllegalArgumentException("Schema cannot be null");
-        }
-        if (!tableName.equals(schema.getTableName())) {
-            throw new IllegalArgumentException("Table name '" + tableName + "' does not match schema table name '" + schema.getTableName() + "'");
-        }
-        if (schema.getColumnCount() == 0) {
-            throw new IllegalArgumentException("Schema must define at least one column");
-        }
-
-        // Check against existing registered schema
-        Schema existing = tableSchemas.get(tableName);
-        if (existing != null) {
-            if (existing.equals(schema)) {
-                return; // Idempotent re-registration of identical schema
+        enterOperation();
+        try {
+            if (tableName == null || !TABLE_NAME_PATTERN.matcher(tableName).matches()) {
+                throw new IllegalArgumentException("Invalid table name: '" + tableName + "'. Must be alphanumeric and up to 64 chars.");
             }
-            throw new IllegalArgumentException("Cannot replace existing schema for table '" + tableName 
-                    + "': existing=" + existing + ", new=" + schema);
-        }
+            if (schema == null) {
+                throw new IllegalArgumentException("Schema cannot be null");
+            }
+            if (!tableName.equals(schema.getTableName())) {
+                throw new IllegalArgumentException("Table name '" + tableName + "' does not match schema table name '" + schema.getTableName() + "'");
+            }
+            if (schema.getColumnCount() == 0) {
+                throw new IllegalArgumentException("Schema must define at least one column");
+            }
 
-        // Check compatibility against already loaded columnar chunks
-        List<ColumnarChunk> existingChunks = columnarTables.get(tableName);
-        if (existingChunks != null && !existingChunks.isEmpty()) {
-            for (ColumnarChunk chunk : existingChunks) {
-                Schema chunkSchema = chunk.getSchema();
-                if (!chunkSchema.equals(schema)) {
-                    throw new IllegalArgumentException("New schema incompatible with existing chunk data for table '" 
-                            + tableName + "': chunkSchema=" + chunkSchema + ", newSchema=" + schema);
+            synchronized (getTableLock(tableName)) {
+                // Check against existing registered schema
+                Schema existing = tableSchemas.get(tableName);
+                if (existing != null) {
+                    if (existing.equals(schema)) {
+                        return; // Idempotent re-registration of identical schema
+                    }
+                    throw new IllegalArgumentException("Cannot replace existing schema for table '" + tableName 
+                            + "': existing=" + existing + ", new=" + schema);
                 }
-            }
-        }
 
-        tableSchemas.put(tableName, schema);
+                // Check compatibility against already loaded columnar chunks
+                List<ColumnarChunk> existingChunks = columnarTables.get(tableName);
+                if (existingChunks != null && !existingChunks.isEmpty()) {
+                    for (ColumnarChunk chunk : existingChunks) {
+                        Schema chunkSchema = chunk.getSchema();
+                        if (!chunkSchema.equals(schema)) {
+                            throw new IllegalArgumentException("New schema incompatible with existing chunk data for table '" 
+                                    + tableName + "': chunkSchema=" + chunkSchema + ", newSchema=" + schema);
+                        }
+                    }
+                }
+
+                tableSchemas.put(tableName, schema);
+            }
+        } finally {
+            exitOperation();
+        }
     }
 
     @Override
@@ -760,15 +810,17 @@ public class HybridStorageManager implements StorageEngine {
             }
             if (records == null || records.isEmpty()) return;
 
-            // Ensure stable table schema across all batches; rejects all-null columns if untyped
-            Schema schema = getOrInferTableSchema(tableName, records);
+            synchronized (getTableLock(tableName)) {
+                // Ensure stable table schema across all batches; rejects all-null columns if untyped
+                Schema schema = getOrInferTableSchema(tableName, records);
 
-            // Partition ingestion into batches of at most config.getColumnarMaxRows()
-            int maxRowsPerChunk = Math.max(1, config.getColumnarMaxRows());
-            for (int i = 0; i < records.size(); i += maxRowsPerChunk) {
-                int toIndex = Math.min(i + maxRowsPerChunk, records.size());
-                List<Map<String, ColumnValue>> subBatch = records.subList(i, toIndex);
-                ingestColumnarChunkWithSchema(tableName, schema, subBatch);
+                // Partition ingestion into batches of at most config.getColumnarMaxRows()
+                int maxRowsPerChunk = Math.max(1, config.getColumnarMaxRows());
+                for (int i = 0; i < records.size(); i += maxRowsPerChunk) {
+                    int toIndex = Math.min(i + maxRowsPerChunk, records.size());
+                    List<Map<String, ColumnValue>> subBatch = records.subList(i, toIndex);
+                    ingestColumnarChunkWithSchema(tableName, schema, subBatch);
+                }
             }
         } finally {
             exitOperation();
