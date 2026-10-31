@@ -1,4 +1,4 @@
-$jarFile = Join-Path $PSScriptRoot "target\aetherdb-2.0.1.jar"
+$jarFile = Join-Path $PSScriptRoot "target\aetherdb-2.0.2.jar"
 if (-not (Test-Path $jarFile)) {
     Write-Host "[INFO] Packaging AetherDB executable jar..." -ForegroundColor Cyan
     & "$PSScriptRoot\build.ps1"

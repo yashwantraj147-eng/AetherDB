@@ -48,6 +48,10 @@ public class WriteAheadLog implements AutoCloseable {
     private volatile long currentSegmentId;
     private volatile boolean closed = false;
 
+    public boolean isClosed() {
+        return closed;
+    }
+
     private final ScheduledExecutorService periodicSyncExecutor;
 
     public WriteAheadLog(File walFile, AetherConfig.WalSyncMode syncMode, long periodicSyncMs) throws IOException {

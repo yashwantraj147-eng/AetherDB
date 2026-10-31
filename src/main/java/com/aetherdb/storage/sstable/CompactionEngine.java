@@ -1,6 +1,7 @@
 package com.aetherdb.storage.sstable;
 
 import com.aetherdb.common.BinaryUtils;
+import com.aetherdb.common.CloseableIterator;
 import com.aetherdb.model.DataRecord;
 
 import java.io.File;
@@ -14,6 +15,7 @@ import java.util.*;
  * 2. Preservation of highest sequence number for duplicate keys.
  * 3. Safe tombstone pruning only when no older level or pending flush exists.
  * 4. Safe independent SSTable creation without retiring inputs prematurely.
+ * 5. Deterministic lifecycle closure of all source SSTable iterators.
  */
 public class CompactionEngine {
 
@@ -61,11 +63,9 @@ public class CompactionEngine {
             totalEstimatedRecords += (int) Math.min(r.getMetadata().getRecordCount(), Integer.MAX_VALUE / 2);
         }
 
-        Iterator<DataRecord> streamingMergeIterator = new StreamingMergeIterator(inputTables, isDeepestLevel);
-
-        // Write the compacted SSTable using streaming iterator
+        // Write the compacted SSTable using streaming iterator inside try-with-resources
         SSTableWriter writer = new SSTableWriter(targetSSTableFile, newTableId, targetLevel, blockSize, bloomFpr);
-        try {
+        try (StreamingMergeIterator streamingMergeIterator = new StreamingMergeIterator(inputTables, isDeepestLevel)) {
             writer.write(streamingMergeIterator, totalEstimatedRecords);
             return new SSTableReader(targetSSTableFile);
         } catch (Throwable t) {
@@ -76,16 +76,19 @@ public class CompactionEngine {
         }
     }
 
-    private static class StreamingMergeIterator implements Iterator<DataRecord> {
+    private static class StreamingMergeIterator implements CloseableIterator<DataRecord> {
         private final PriorityQueue<MergeElement> minHeap = new PriorityQueue<>();
+        private final List<CloseableIterator<DataRecord>> sourceIterators = new ArrayList<>();
         private final boolean isDeepestLevel;
         private byte[] lastEmittedKey = null;
         private DataRecord nextRecord = null;
+        private boolean closed = false;
 
         public StreamingMergeIterator(List<SSTableReader> inputTables, boolean isDeepestLevel) {
             this.isDeepestLevel = isDeepestLevel;
             for (int i = 0; i < inputTables.size(); i++) {
-                Iterator<DataRecord> it = inputTables.get(i).iterator();
+                CloseableIterator<DataRecord> it = inputTables.get(i).iterator();
+                sourceIterators.add(it);
                 if (it.hasNext()) {
                     minHeap.add(new MergeElement(it.next(), i, it));
                 }
@@ -122,17 +125,30 @@ public class CompactionEngine {
 
         @Override
         public boolean hasNext() {
+            if (closed) return false;
             return nextRecord != null;
         }
 
         @Override
         public DataRecord next() {
-            if (nextRecord == null) {
+            if (closed || nextRecord == null) {
                 throw new NoSuchElementException();
             }
             DataRecord res = nextRecord;
             advance();
             return res;
+        }
+
+        @Override
+        public void close() {
+            if (closed) return;
+            closed = true;
+            minHeap.clear();
+            for (CloseableIterator<DataRecord> it : sourceIterators) {
+                try {
+                    it.close();
+                } catch (Throwable ignored) {}
+            }
         }
     }
 }

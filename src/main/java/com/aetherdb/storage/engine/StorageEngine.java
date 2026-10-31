@@ -2,20 +2,22 @@ package com.aetherdb.storage.engine;
 
 import com.aetherdb.model.ColumnValue;
 import com.aetherdb.model.DataRecord;
+import com.aetherdb.model.Schema;
 import com.aetherdb.storage.columnar.ColumnarChunk;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 
 /**
- * Unified storage engine interface for AetherDB.
- * Supports transactional key-value operations and columnar analytical ingestion.
+ * StorageEngine interface defining operations for both Key-Value (LSM-Tree)
+ * and Columnar Analytics workloads, plus lifecycle management.
  */
-public interface StorageEngine extends AutoCloseable {
+public interface StorageEngine extends Closeable {
 
     /**
-     * Inserts or updates a key-value record.
+     * Inserts or updates a key-value record durably.
      */
     void put(byte[] key, byte[] value) throws IOException;
 
@@ -59,4 +61,34 @@ public interface StorageEngine extends AutoCloseable {
      * Returns a snapshot of internal engine performance metrics.
      */
     Map<String, Object> getMetrics();
+
+    /**
+     * Explicitly registers a table schema for columnar analytics.
+     */
+    default void registerTableSchema(Schema schema) {
+    }
+
+    default void registerTableSchema(String tableName, Schema schema) {
+        registerTableSchema(schema);
+    }
+
+    /**
+     * Retrieves the registered schema for a columnar table, or null if not yet defined.
+     */
+    default Schema getTableSchema(String tableName) {
+        return null;
+    }
+
+    /**
+     * Returns the current lifecycle state of the storage engine.
+     */
+    default LifecycleState getLifecycleState() {
+        return LifecycleState.OPEN;
+    }
+
+    /**
+     * Retries flushing any failed or queued MemTables and attempts to recover from FAILED state.
+     */
+    default void retryFailedFlushes() throws IOException {
+    }
 }

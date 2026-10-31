@@ -2,12 +2,14 @@ package com.aetherdb.test;
 
 import com.aetherdb.common.AetherConfig;
 import com.aetherdb.common.Constants;
+import com.aetherdb.model.ColumnDefinition;
 import com.aetherdb.model.ColumnType;
 import com.aetherdb.model.ColumnValue;
 import com.aetherdb.model.Schema;
 import com.aetherdb.storage.columnar.ColumnDecoder;
 import com.aetherdb.storage.columnar.ColumnEncoder;
 import com.aetherdb.storage.columnar.ColumnarChunk;
+import com.aetherdb.storage.columnar.ZoneMap;
 import com.aetherdb.storage.engine.HybridStorageManager;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -218,5 +220,122 @@ public class ColumnarStorageTest {
         assertEquals(5, chunks.get(0).getRowCount());
         assertEquals(5, chunks.get(1).getRowCount());
         assertEquals(2, chunks.get(2).getRowCount());
+    }
+
+    @Test
+    @DisplayName("Schema inference: initial all-null batch without registered schema is strictly rejected")
+    void testInitialAllNullBatchWithoutSchemaRejected() {
+        Map<String, ColumnValue> nullRow = new HashMap<>();
+        nullRow.put("id", ColumnValue.ofLong(1));
+        nullRow.put("unknown_field", ColumnValue.ofNull());
+
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class, () -> {
+            storage.ingestColumnar("null_test_table", List.of(nullRow));
+        });
+        assertTrue(ex.getMessage().contains("Cannot infer column type") && ex.getMessage().contains("all values in batch are untyped null"));
+    }
+
+    @Test
+    @DisplayName("Explicit schema registration: resolves initial all-null batches and accepts subsequent typed batches")
+    void testExplicitSchemaRegistrationWithAllNullBatch() throws Exception {
+        Schema schema = new Schema("events", List.of(
+                new ColumnDefinition("id", ColumnType.INT64),
+                new ColumnDefinition("latency", ColumnType.FLOAT64)
+        ));
+        storage.registerTableSchema("events", schema);
+        assertEquals(schema, storage.getTableSchema("events"));
+
+        // Ingest initial batch where latency is null
+        Map<String, ColumnValue> row1 = new HashMap<>();
+        row1.put("id", ColumnValue.ofLong(101));
+        row1.put("latency", ColumnValue.ofNull(ColumnType.FLOAT64));
+        assertDoesNotThrow(() -> storage.ingestColumnar("events", List.of(row1)));
+
+        // Ingest subsequent batch with valid numeric latency
+        Map<String, ColumnValue> row2 = new HashMap<>();
+        row2.put("id", ColumnValue.ofLong(102));
+        row2.put("latency", ColumnValue.ofDouble(42.5));
+        assertDoesNotThrow(() -> storage.ingestColumnar("events", List.of(row2)));
+
+        List<ColumnarChunk> chunks = storage.getColumnarChunks("events");
+        assertEquals(2, chunks.size());
+        assertEquals(ColumnType.FLOAT64, chunks.get(0).getSchema().getColumnType("latency"));
+    }
+
+    @Test
+    @DisplayName("Immutability: ColumnarChunk internal state cannot be mutated by caller")
+    void testColumnarChunkImmutability() {
+        Schema schema = new Schema("test_table", List.of(
+                new ColumnDefinition("val", ColumnType.INT64)
+        ));
+        byte[] originalBytes = new byte[]{1, 2, 3, 4};
+        Map<String, byte[]> encodedMap = new HashMap<>();
+        encodedMap.put("val", originalBytes);
+
+        Map<String, ZoneMap> zoneMaps = Map.of(
+                "val", new ZoneMap(ColumnType.INT64)
+        );
+
+        ColumnarChunk chunk = new ColumnarChunk(1L, schema, 1, zoneMaps, encodedMap);
+
+        // Mutating the input array after chunk creation must not affect the chunk
+        originalBytes[0] = 99;
+        assertEquals(1, chunk.getEncodedColumn("val")[0]);
+
+        // Mutating array returned by getEncodedColumn() must not affect chunk
+        byte[] retrieved = chunk.getEncodedColumn("val");
+        retrieved[0] = 77;
+        assertEquals(1, chunk.getEncodedColumn("val")[0]);
+
+        // Modifying decoded column list returned by getDecodedColumn must throw UnsupportedOperationException
+        ColumnEncoder encoder = new ColumnEncoder(ColumnType.INT64, 0.70);
+        byte[] validEncoded = encoder.encode(List.of(ColumnValue.ofLong(42)));
+        ColumnarChunk validChunk = new ColumnarChunk(2L, schema, 1, zoneMaps, Map.of("val", validEncoded));
+        List<ColumnValue> decoded = validChunk.getDecodedColumn("val");
+        assertThrows(UnsupportedOperationException.class, () -> {
+            decoded.add(ColumnValue.ofLong(999));
+        });
+    }
+
+    @Test
+    @DisplayName("Schema consistency across restart: schema is retained and enforced after reopening database")
+    void testSchemaPreservedAcrossRestart() throws Exception {
+        Schema schema = new Schema("persistent_table", List.of(
+                new ColumnDefinition("id", ColumnType.INT64),
+                new ColumnDefinition("score", ColumnType.FLOAT64)
+        ));
+        storage.registerTableSchema("persistent_table", schema);
+        storage.ingestColumnar("persistent_table", List.of(
+                Map.of("id", ColumnValue.ofLong(1), "score", ColumnValue.ofDouble(95.0))
+        ));
+
+        // Reopen storage engine
+        storage.close();
+        AetherConfig config = new AetherConfig();
+        config.setProperty("storage.wal.dir", tempDir.resolve("wal").toString());
+        config.setProperty("storage.sstable.dir", tempDir.resolve("sstable").toString());
+        config.setProperty("storage.columnar.dir", tempDir.resolve("columnar").toString());
+        config.setProperty("storage.data.dir", tempDir.resolve("storage").toString());
+        config.validateAndCreateDirectories();
+        storage = new HybridStorageManager(config);
+
+        // Verify chunks loaded and schema is preserved
+        List<ColumnarChunk> chunks = storage.getColumnarChunks("persistent_table");
+        assertEquals(1, chunks.size());
+        assertEquals(ColumnType.FLOAT64, chunks.get(0).getSchema().getColumnType("score"));
+
+        // Subsequent valid batch succeeds
+        assertDoesNotThrow(() -> {
+            storage.ingestColumnar("persistent_table", List.of(
+                    Map.of("id", ColumnValue.ofLong(2), "score", ColumnValue.ofDouble(88.0))
+            ));
+        });
+
+        // Batch with wrong column type fails
+        assertThrows(IllegalArgumentException.class, () -> {
+            storage.ingestColumnar("persistent_table", List.of(
+                    Map.of("id", ColumnValue.ofLong(3), "score", ColumnValue.ofString("invalid_string_score"))
+            ));
+        });
     }
 }

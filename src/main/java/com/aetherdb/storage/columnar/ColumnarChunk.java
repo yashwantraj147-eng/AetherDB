@@ -22,6 +22,7 @@ import java.util.zip.CRC32;
  * Immutable on-disk and in-memory representation of a columnar chunk.
  * Stores compressed columns (RLE/Dictionary) and Zone Maps for fast vector scans.
  * Enforces strict 8-byte CRC32 footer verification and bounded chunk allocation.
+ * Guarantees immutability through defensive array copying and unmodifiable collections.
  */
 public class ColumnarChunk {
 
@@ -43,7 +44,13 @@ public class ColumnarChunk {
         this.schema = schema;
         this.rowCount = rowCount;
         this.zoneMaps = Collections.unmodifiableMap(new HashMap<>(zoneMaps));
-        this.encodedColumns = Collections.unmodifiableMap(new HashMap<>(encodedColumns));
+        Map<String, byte[]> copy = new HashMap<>();
+        if (encodedColumns != null) {
+            for (Map.Entry<String, byte[]> entry : encodedColumns.entrySet()) {
+                copy.put(entry.getKey(), entry.getValue() != null ? entry.getValue().clone() : null);
+            }
+        }
+        this.encodedColumns = Collections.unmodifiableMap(copy);
     }
 
     public long getChunkId() {
@@ -67,15 +74,20 @@ public class ColumnarChunk {
     }
 
     public byte[] getEncodedColumn(String columnName) {
-        return encodedColumns.get(columnName);
+        byte[] bytes = encodedColumns.get(columnName);
+        return bytes != null ? bytes.clone() : null;
     }
 
     public Map<String, byte[]> getEncodedColumns() {
-        return encodedColumns;
+        Map<String, byte[]> copy = new HashMap<>();
+        for (Map.Entry<String, byte[]> entry : encodedColumns.entrySet()) {
+            copy.put(entry.getKey(), entry.getValue() != null ? entry.getValue().clone() : null);
+        }
+        return Collections.unmodifiableMap(copy);
     }
 
     /**
-     * Lazily decodes and caches column values in memory.
+     * Lazily decodes and caches column values in memory as unmodifiable lists.
      */
     public List<ColumnValue> getDecodedColumn(String columnName) {
         return decodedCache.computeIfAbsent(columnName, col -> {
@@ -87,7 +99,8 @@ public class ColumnarChunk {
             if (type == null) {
                 type = ColumnType.STRING;
             }
-            return ColumnDecoder.decode(encoded, type, rowCount);
+            List<ColumnValue> decoded = ColumnDecoder.decode(encoded, type, rowCount);
+            return Collections.unmodifiableList(decoded);
         });
     }
 

@@ -4,6 +4,45 @@ All notable changes and architectural repairs in **AetherDB V2** are documented 
 
 ---
 
+## [2.0.2] - 2026-10-31
+
+### Storage Engine Lifecycle & Shutdown Safety (Priority 0)
+- **Engine Lifecycle State Machine**: Introduced explicit `LifecycleState` (`OPEN`, `CLOSING`, `CLOSED`, `FAILED`). Transition into `CLOSING` immediately rejects any new write operations, flushes, and background compactions.
+- **Double-Check State Under Synchronization**: `put()`, `delete()`, and `get()` validate lifecycle state both before and after acquiring engine read/write locks, preventing concurrent close calls from racing ahead and attempting writes against closing or closed storage resources.
+- **Graceful Bounded Shutdown with Leak Protection**: Shutdown awaits in-flight background tasks up to a bounded timeout. If tasks do not terminate within the timeout, resources (WAL and active SSTables) are safely left open in `CLOSING` state rather than closed beneath active threads, allowing clean retry.
+- **Worker Publication Guard**: Background flush and compaction workers verify engine lifecycle state before installing any SSTables; completed tables produced by tasks cancelled during shutdown are cleanly discarded and closed without polluting the live collection.
+- **Thread Safety & Idempotent Close**: Made `close()` concurrent-safe and idempotent using atomic state transitions.
+
+### Flush Recovery & WAL Durability (Priority 0)
+- **Pre-Rotated WAL Swapping**: In `triggerMemTableFlush()`, the active WAL segment is rotated *prior* to swapping out the active MemTable. If WAL rotation fails, the engine transitions to `FAILED` state, rejects writes, and preserves the active MemTable and its WAL segment without acknowledged data loss.
+- **Asynchronous Flush Ownership**: Tracked MemTable flush lifecycle with `CompletableFuture<File>`, preventing duplicate concurrent flushes and enabling callers to safely await in-flight background flushes.
+- **Manual Flush Synchronization**: `flushMemTable()` blocks and awaits any in-flight background flushes before proceeding, guaranteeing all acknowledged memory state is durably installed.
+- **Failed MemTable Recovery & Retry**: Added `retryFailedFlushes()` to re-attempt failed MemTable flushes and recover from transient disk or I/O errors.
+- **Post-Publication WAL Segment Retirement**: Deferred deletion or obsolescence of WAL segments (`retireAssociatedWal()`) until *after* the resulting SSTable is fully installed and published in the storage engine.
+
+### Binary Deserialization Hardening & Overflow Safety (Priority 1)
+- **Defensive Schema Deserialization**: Added explicit allocation bounds to `Schema.deserialize()` (`MAX_COLUMNS = 10,000`, max table name length = 255, max column name length = 255). Rejects negative column counts, duplicate column names, unsupported column type IDs, and truncated buffers with descriptive `CorruptedSchemaException`.
+- **SSTable Offset Overflow Protection**: Replaced raw integer/long arithmetic in `SSTableReader` metadata offset calculations with `Math.addExact()`. Verifies that index and Bloom filter regions do not overlap the header, do not overlap each other, and do not exceed the actual file size. Rejects malformed offsets with `CorruptedSSTableException`.
+
+### SSTable Iterator Resource Lifecycle (Priority 1)
+- **CloseableIterator Contract**: Introduced `CloseableIterator<DataRecord>` extending `Iterator<DataRecord>` and `AutoCloseable`.
+- **Guaranteed Reader Reference Release**: The iterator acquires an SSTable reference count and guarantees its release exactly once upon full consumption, early explicit `close()`, or I/O failure during block loading. Repeated `close()` calls are idempotent and safe.
+- **Compaction Source Cleanup**: Wrapped all source iterators in `CompactionEngine.StreamingMergeIterator` with try-with-resources and explicit `close()` in `finally` blocks, eliminating reader reference leaks during successful or failed compaction passes.
+
+### Columnar Schema Inference & Immutability (Priority 2)
+- **Strict Untyped Null Ingestion Policy**: Initial columnar ingestion batches containing untyped null values for all rows in a column are strictly rejected with descriptive `IllegalArgumentException`, rather than silently defaulting to `STRING`.
+- **Explicit Schema Registration**: Added `registerTableSchema(Schema)` and `registerTableSchema(String, Schema)` on `StorageEngine` and `HybridStorageManager`. Tables with pre-registered schemas permit initial all-null batches while retaining their declared numeric or timestamp types.
+- **ColumnarChunk Immutability**: Enforced defensive copying of byte arrays in `ColumnarChunk` constructor and accessors (`getEncodedColumn()`, `getEncodedColumns()`). Decoded cached column lists returned by `getDecodedColumn()` are wrapped in unmodifiable lists.
+
+### REST API Security & CORS Hardening (Priority 2)
+- **Vary: Origin Header Reflection**: Added `Vary: Origin` response header whenever dynamically reflecting an allowlisted origin, preventing cache poisoning across disparate web clients.
+- **Comprehensive Regression Test Matrix**: Expanded `RestApiSecurityTest` to verify all 10 security and CORS scenarios: missing tokens, invalid tokens, valid Bearer tokens, external binding without auth (rejected), external binding with auth (permitted), allowed origins, rejected origins (403 on preflight, no header reflection on GET), OPTIONS preflight methods and headers, and multi-origin allowlists.
+
+### Build & Test Suite Expansion
+- **68 Automated Unit & Regression Tests**: Test suite expanded from 44 to 68 automated JUnit 5 tests covering all lifecycle transitions, shutdown races, WAL pre-rotation safety, closeable iterators, binary bounds, columnar immutability, and CORS scenarios with 100% pass rate.
+
+---
+
 ## [2.0.1] - 2026-10-31
 
 ### Storage Engine & Crash Safety (Priority 0)

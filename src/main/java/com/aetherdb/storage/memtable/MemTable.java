@@ -2,9 +2,12 @@ package com.aetherdb.storage.memtable;
 
 import com.aetherdb.common.BinaryUtils;
 import com.aetherdb.model.DataRecord;
+import com.aetherdb.storage.sstable.SSTableReader;
 
+import java.io.File;
 import java.util.Collection;
 import java.util.Iterator;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -32,6 +35,9 @@ public class MemTable implements Iterable<DataRecord> {
     private final AtomicLong byteSize = new AtomicLong(0);
     private final AtomicReference<State> state = new AtomicReference<>(State.ACTIVE);
 
+    private volatile File associatedWalFile;
+    private volatile CompletableFuture<SSTableReader> flushFuture;
+
     private volatile long minSequenceNumber = Long.MAX_VALUE;
     private volatile long maxSequenceNumber = Long.MIN_VALUE;
 
@@ -54,6 +60,22 @@ public class MemTable implements Iterable<DataRecord> {
 
     public long getId() {
         return id;
+    }
+
+    public File getAssociatedWalFile() {
+        return associatedWalFile;
+    }
+
+    public void setAssociatedWalFile(File associatedWalFile) {
+        this.associatedWalFile = associatedWalFile;
+    }
+
+    public CompletableFuture<SSTableReader> getFlushFuture() {
+        return flushFuture;
+    }
+
+    public void setFlushFuture(CompletableFuture<SSTableReader> flushFuture) {
+        this.flushFuture = flushFuture;
     }
 
     /**

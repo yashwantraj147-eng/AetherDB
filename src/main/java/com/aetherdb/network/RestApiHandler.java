@@ -200,7 +200,8 @@ public class RestApiHandler implements HttpHandler {
                 String[] allowedList = allowed.split(",");
                 for (String a : allowedList) {
                     if (a.trim().equalsIgnoreCase(origin.trim())) {
-                        exchange.getResponseHeaders().set("Access-Control-Allow-Origin", origin);
+                        exchange.getResponseHeaders().set("Access-Control-Allow-Origin", origin.trim());
+                        exchange.getResponseHeaders().set("Vary", "Origin");
                         break;
                     }
                 }
