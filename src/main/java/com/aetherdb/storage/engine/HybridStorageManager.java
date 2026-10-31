@@ -833,7 +833,7 @@ public class HybridStorageManager implements StorageEngine {
             return existing;
         }
 
-        Map<String, ColumnType> colTypes = new LinkedHashMap<>();
+        Map<String, ColumnType> colTypes = new TreeMap<>();
         // Scan all rows to find non-null types
         for (Map<String, ColumnValue> row : records) {
             for (Map.Entry<String, ColumnValue> entry : row.entrySet()) {

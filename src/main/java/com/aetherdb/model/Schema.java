@@ -170,12 +170,27 @@ public class Schema {
         if (this == o) return true;
         if (o == null || getClass() != o.getClass()) return false;
         Schema schema = (Schema) o;
-        return Objects.equals(tableName, schema.tableName) && Objects.equals(columns, schema.columns);
+        if (!Objects.equals(tableName, schema.tableName)) return false;
+        if (columns.size() != schema.columns.size()) return false;
+        Map<String, ColumnType> thisMap = new HashMap<>();
+        for (ColumnDefinition col : columns) {
+            thisMap.put(col.getName(), col.getType());
+        }
+        for (ColumnDefinition col : schema.columns) {
+            if (!thisMap.containsKey(col.getName()) || thisMap.get(col.getName()) != col.getType()) {
+                return false;
+            }
+        }
+        return true;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(tableName, columns);
+        Map<String, ColumnType> map = new TreeMap<>();
+        for (ColumnDefinition col : columns) {
+            map.put(col.getName(), col.getType());
+        }
+        return Objects.hash(tableName, map);
     }
 
     @Override
